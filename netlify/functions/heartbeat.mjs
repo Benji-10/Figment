@@ -8,7 +8,7 @@
 // look at a small batch of the most recently active conversations per
 // run rather than the whole table.
 
-import { db } from "./_lib/db.mjs";
+import { db, ensureSchema } from "./_lib/db.mjs";
 import { getRecentMessages, getRecentMemories } from "./_lib/conversation.mjs";
 import { generateStructured } from "./_lib/gemini.mjs";
 import {
@@ -22,6 +22,7 @@ const MIN_GAP_MINUTES = 25; // don't re-check the same conversation more often t
 const ACTIVE_WINDOW_DAYS = 3; // only consider conversations touched in the last N days
 
 export default async (req) => {
+  await ensureSchema();
   const database = db();
 
   const activeWindow = `${ACTIVE_WINDOW_DAYS} days`;

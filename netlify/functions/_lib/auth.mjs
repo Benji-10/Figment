@@ -1,5 +1,5 @@
 import { getUser } from "@netlify/identity";
-import { db } from "./db.mjs";
+import { db, ensureSchema } from "./db.mjs";
 
 export class HttpError extends Error {
   constructor(status, message) {
@@ -12,6 +12,8 @@ export class HttpError extends Error {
 // sure we have a matching row in app_users (creating/refreshing it as
 // needed). Every function that touches the chat calls this first.
 export async function requireUser() {
+  await ensureSchema();
+
   const identityUser = await getUser();
   if (!identityUser) {
     throw new HttpError(401, "You need to be logged in.");

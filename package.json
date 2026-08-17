@@ -8,7 +8,7 @@
     "build": "esbuild src/app.js --bundle --format=esm --outfile=public/app.bundled.js"
   },
   "dependencies": {
-    "@netlify/database": "^1.1.0",
+    "@neondatabase/serverless": "^1.1.0",
     "@netlify/identity": "^1.2.0"
   },
   "devDependencies": {
