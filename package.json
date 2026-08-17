@@ -1,0 +1,17 @@
+{
+  "name": "ai-companion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Basic persistent AI character chat — Netlify Functions + Netlify Database (Neon) + Netlify Identity + Gemini.",
+  "scripts": {
+    "build": "esbuild src/app.js --bundle --format=esm --outfile=public/app.bundled.js"
+  },
+  "dependencies": {
+    "@netlify/database": "^1.1.0",
+    "@netlify/identity": "^1.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
