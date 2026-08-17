@@ -59,19 +59,25 @@ the model with the `GEMINI_MODEL` environment variable if that changes again.
 
 ## Deploy
 
-1. **Push this project to a Git repo** (GitHub/GitLab/Bitbucket) and create a
+1. **Get a Neon Postgres database.** Easiest: create a free project at
+   [neon.tech](https://neon.tech) and copy its connection string. (You can
+   also use Netlify's "Neon" extension from the Extensions marketplace if
+   your account has it — either way you end up with a connection string.)
+   Netlify's newer one-click "Database" auto-provisioning feature is **not**
+   required and isn't used here — it's gated to certain account plans, which
+   is exactly what this setup avoids depending on.
+2. **Push this project to a Git repo** (GitHub/GitLab/Bitbucket) and create a
    new Netlify site from it, or run `netlify init` from this folder.
-2. **Enable Identity**: Project configuration → Identity → Enable Identity.
+3. **Enable Identity**: Project configuration → Identity → Enable Identity.
    For quick testing without email confirmation, also turn on autoconfirm
    under Identity → Emails → Confirmation template.
-3. **Add a database**: Project → Database → Create a database (or run
-   `netlify database init` from the CLI). Netlify auto-runs the migration in
-   `netlify/database/migrations/0001_init.sql` on the next deploy — this
-   creates the schema and seeds the default character.
-4. **Set your Gemini key**: Project configuration → Environment variables →
-   add `GEMINI_API_KEY` (get one at https://aistudio.google.com/apikey).
+4. **Set environment variables**: Project configuration → Environment
+   variables → add `DATABASE_URL` (your Neon connection string) and
+   `GEMINI_API_KEY` (from https://aistudio.google.com/apikey).
 5. **Deploy.** `npm run build` bundles the client; Netlify Functions picks up
-   everything in `netlify/functions/` automatically.
+   everything in `netlify/functions/` automatically. The app creates its own
+   tables and seeds the default character on its very first request — no
+   migration step, no CLI database commands.
 
 ## Local development
 
@@ -81,30 +87,36 @@ netlify link        # or: netlify init
 netlify dev
 ```
 
-`netlify dev` builds the client, serves `public/`, runs the functions, spins
-up a local Postgres database branch, and reads/writes cookies over
-`http://localhost` for Identity (modern browsers treat localhost as a secure
+Add `DATABASE_URL` and `GEMINI_API_KEY` to a local `.env` file (see
+`.env.example`) before running `netlify dev`. It builds the client, serves
+`public/`, runs the functions, and reads/writes Identity's session cookies
+over `http://localhost` (modern browsers treat localhost as a secure
 context, so this works without HTTPS locally).
+
 
 ## Editing the character
 
-The character's persona lives in the `characters` table, seeded by the
-migration. Easiest way to tweak it: Netlify dashboard → Database → open the
-table editor and edit the `sam` row directly (persona, communication_style,
-current_activity, current_mood). To add a second character, insert a new row
-and point `CHARACTER_SLUG` (env var) at its `slug`.
+The character's persona lives in the `characters` table, seeded
+automatically the first time the app runs (see
+`netlify/functions/_lib/schema.mjs` — `db/schema.sql` has the same DDL if
+you'd rather run it by hand in Neon's SQL editor first). Easiest way to
+tweak it: open Neon's SQL editor (or any Postgres client) and update the
+`sam` row directly (persona, communication_style, current_activity,
+current_mood). To add a second character, insert a new row and point
+`CHARACTER_SLUG` (env var) at its `slug`.
 
 ## Environment variables
 
 | Variable                | Required | Default                  |
 |--------------------------|----------|---------------------------|
+| `DATABASE_URL`           | yes      | —                          |
 | `GEMINI_API_KEY`         | yes      | —                          |
 | `GEMINI_MODEL`           | no       | `gemini-3.1-flash-lite`    |
 | `GEMINI_THINKING_LEVEL`  | no       | `low`                      |
 | `CHARACTER_SLUG`         | no       | `sam`                      |
 
-`NETLIFY_DATABASE_URL` and Identity's cookies are wired up automatically by
-the platform — nothing to configure for those.
+Identity's session cookies are wired up automatically by the platform once
+Identity is enabled — nothing to configure for that.
 
 ## Cost/scale notes
 
@@ -120,8 +132,8 @@ cut costs further at higher scale.
 ## File map
 
 ```
-netlify/database/migrations/0001_init.sql   schema + seed character
-netlify/functions/_lib/                     shared: db, auth, gemini, persona
+db/schema.sql                               reference DDL (optional — app self-applies this)
+netlify/functions/_lib/                     shared: db, schema, auth, gemini, persona
 netlify/functions/me.mjs                    GET  /api/me       bootstrap
 netlify/functions/messages.mjs              GET  /api/messages history/polling
 netlify/functions/chat.mjs                  POST /api/chat     send a message
