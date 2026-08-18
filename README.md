@@ -15,38 +15,69 @@ layered on without re-architecting anything.
 **Implemented:**
 - Netlify Identity login/signup, gating the chat behind auth
 - Netlify Database (Neon) schema: users, characters, conversations,
-  messages, reactions, memories
+  messages, reactions, memories, recurring/calendar events
 - A persistent character with a stable persona *and* mutable state
-  (`current_activity`, `current_mood`) — spec §2
+  (`current_mood`, plus a live `current_activity` now driven by the
+  calendar — see below) — spec §2
+- **Calendar / event engine** (spec §3–4): recurring weekly events
+  (seminar, work shift, family call) materialize into concrete dated
+  events automatically; the model can create/move/cancel/extend events
+  through structured output (`calendar_action`), validated and executed
+  deterministically by the app. Overlapping creates/moves are caught
+  before they're applied — the app detects the conflict, asks the model
+  in-character how it wants to resolve it (keep the new plan and cancel
+  the old one, or drop the new plan), and applies whichever it picks, the
+  same "clash flow" the spec walks through. `extend` handles realistic
+  drift (a shift running long) without needing AI involvement — that's
+  pure arithmetic, so the app just does it.
+- **Response-session batching** (spec §7–8): each recurring/calendar
+  event can be marked "busy." While the character is in a busy event,
+  incoming messages don't get an immediate full reply — at most one short
+  acknowledgment (only if the app's quick urgency check thinks it's worth
+  interrupting for), and the actual reply is deferred. Multiple messages
+  sent during that window all get answered together in **one** reply once
+  the character is free again, instead of one delayed reply per message.
+  The deferred delivery piggybacks on the heartbeat (below), so it shows
+  up automatically via the existing polling — no extra client-side wiring.
 - Chat UI: bubbles, grouping, date separators, typing indicator sized to
   message length, read receipts, reply-to-message (double-click a bubble,
   or long-press), emoji reactions in both directions (long-press a bubble)
-- The AI replies with **structured output** (1–3 message bubbles, an
-  optional reaction, an optional new memory) rather than free text — the
-  app owns delivery timing/mechanics, the model owns interpretation, per
-  the spec's central architectural principle
+- The AI replies with **structured output** (message bubbles, an optional
+  reaction, an optional new memory, an optional calendar action) rather
+  than free text — the app owns delivery timing/mechanics and calendar
+  validation, the model owns interpretation, per the spec's central
+  architectural principle
 - A flat per-conversation memory list fed back into every prompt (spec §9,
   without the decay/forgetting-curve refinement in §11)
-- A **scheduled function** (`heartbeat.mjs`, every 15 min) that lets the
-  character message users on its own when nothing prompted it — the "life
-  continues without you" half of the spec (§12), simplified: it checks
-  recently-active conversations and asks the model whether it spontaneously
-  wants to say something, most of the time landing on "no"
+- A **scheduled function** (`heartbeat.mjs`, every 15 min) that does two
+  jobs: delivers batched replies for conversations with pending messages
+  once the character is free, and — for conversations with nothing
+  pending — occasionally lets the character message first, unprompted
+  (skipped entirely while busy). Either way it can also quietly touch the
+  calendar (e.g. tentatively planning something) even without sending a
+  message.
 - Lightweight polling (every 7s while the tab is visible) so a spontaneous
-  heartbeat message shows up without a websocket/Blobs realtime setup
+  or deferred message shows up without a websocket/Blobs realtime setup;
+  the header status line also refreshes every 60s so "current activity"
+  stays live as the character's day progresses
 
-**Deliberately left out / stubbed for later phases** (see the original spec
-for the full design):
-- Calendar/event engine, event transitions, conflict resolution (§3–4)
-- Conversation response sessions that batch several unanswered messages
-  into one decision (§8) — right now each `/api/chat` call handles one
-  user message at a time
+**Deliberately left out / stubbed for later phases** (see the original
+spec for the full design):
+- Conversation response sessions batch by *busy status*, not by a
+  message-priority/urgency model that can interrupt anything — the spec's
+  fuller picture (§7) has urgency potentially overriding almost any
+  activity; here "busy" is a fixed per-event flag and only urgent messages
+  get even a short acknowledgment, full replies always wait
+- No tentative-vs-confirmed distinction for AI-made plans (spec §6) —
+  `calendar_action: create` always makes a concrete, confirmed event
+- No per-character timezone modeling — all calendar arithmetic uses a
+  single implicit clock (effectively UTC); fine for a demo, not for a
+  real multi-timezone deployment
 - Memory decay/forgetting curve and semantic retrieval — memories are a
   flat recency-ordered list, capped at 8 in context (§9, §11)
-- Urgency-aware interruption behavior (§7) — the character always responds
-  when messaged; there's no "busy right now" gating yet, though
-  `current_activity`/`current_mood` are already in the data model to build
-  that on top of
+- No `search_calendar`/`search_memory`/`search_messages` tool-calling loop
+  — the model gets a compact snapshot of upcoming events and recent
+  memories up front rather than being able to query for more on demand
 - Multiple characters (schema supports it; the app only looks up one slug)
 
 ## A note on the model name
@@ -94,16 +125,23 @@ over `http://localhost` (modern browsers treat localhost as a secure
 context, so this works without HTTPS locally).
 
 
-## Editing the character
+## Editing the character / calendar
 
-The character's persona lives in the `characters` table, seeded
-automatically the first time the app runs (see
-`netlify/functions/_lib/schema.mjs` — `db/schema.sql` has the same DDL if
-you'd rather run it by hand in Neon's SQL editor first). Easiest way to
-tweak it: open Neon's SQL editor (or any Postgres client) and update the
-`sam` row directly (persona, communication_style, current_activity,
-current_mood). To add a second character, insert a new row and point
-`CHARACTER_SLUG` (env var) at its `slug`.
+The character's persona and weekly rhythm live in the `characters` and
+`recurring_events` tables, seeded automatically the first time the app runs
+(see `netlify/functions/_lib/schema.mjs` — `db/schema.sql` has the same DDL
+if you'd rather run it by hand in Neon's SQL editor first). Easiest way to
+tweak either: open Neon's SQL editor (or any Postgres client):
+- Edit the `sam` row in `characters` for persona/mood/tagline.
+- Edit rows in `recurring_events` for the weekly schedule — `busy = true`
+  means messages during that event get deferred and batched (response
+  sessions); `busy = false` means the character replies normally even
+  during it (like the seeded Sunday family call).
+- One-off plans the AI makes show up in `calendar_events` with
+  `source = 'planned'`; recurring-derived ones have `source = 'recurring'`.
+
+To add a second character, insert a new row and point `CHARACTER_SLUG` (env
+var) at its `slug`.
 
 ## Environment variables
 
@@ -123,22 +161,32 @@ Identity is enabled — nothing to configure for that.
 The heartbeat function checks at most 5 recently-active conversations every
 15 minutes, and skips any conversation it already checked in the last 25
 minutes — so it stays cheap even as users grow, at the cost of spontaneous
-messages sometimes landing later than the spec's ideal 3-minute cadence. If
-you deploy this for real usage, that batch size/interval in `heartbeat.mjs`
-is the first knob to revisit, and a cheap pre-filter before calling Gemini
-(e.g. only call the model if a conversation is "due" by some heuristic) would
-cut costs further at higher scale.
+and deferred-batch messages sometimes landing later than the spec's ideal
+3-minute cadence (worst case for a batched reply: up to ~25 minutes after a
+busy event ends). If you deploy this for real usage, that batch size/interval
+in `heartbeat.mjs` is the first knob to revisit, and a cheap pre-filter
+before calling Gemini (e.g. only call the model if a conversation is "due"
+by some heuristic) would cut costs further at higher scale. A calendar
+conflict adds one extra Gemini call (only when a conflict actually occurs),
+so it's rare in practice.
 
 ## File map
 
 ```
 db/schema.sql                               reference DDL (optional — app self-applies this)
-netlify/functions/_lib/                     shared: db, schema, auth, gemini, persona
-netlify/functions/me.mjs                    GET  /api/me       bootstrap
+netlify/functions/_lib/db.mjs               Neon connection + self-applying schema
+netlify/functions/_lib/schema.mjs           table DDL + seed character/recurring events
+netlify/functions/_lib/auth.mjs             Identity verification
+netlify/functions/_lib/conversation.mjs     character/conversation/message lookups
+netlify/functions/_lib/calendar.mjs         calendar engine: materialize, conflicts, actions
+netlify/functions/_lib/gemini.mjs           Gemini Interactions API client
+netlify/functions/_lib/persona.mjs          system prompts + response JSON schemas
+netlify/functions/_lib/reply.mjs            shared reply/ack/spontaneous delivery logic
+netlify/functions/me.mjs                    GET  /api/me       bootstrap + live status
 netlify/functions/messages.mjs              GET  /api/messages history/polling
-netlify/functions/chat.mjs                  POST /api/chat     send a message
+netlify/functions/chat.mjs                  POST /api/chat     send a message (busy-gated)
 netlify/functions/react.mjs                 POST /api/react    toggle a reaction
-netlify/functions/heartbeat.mjs             scheduled          spontaneous messages
+netlify/functions/heartbeat.mjs             scheduled          batched replies + spontaneous messages
 src/app.js                                  client logic (bundled to public/)
 public/index.html, public/styles.css        chat UI
 ```

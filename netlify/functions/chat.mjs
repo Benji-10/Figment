@@ -1,18 +1,8 @@
 import { requireUser, jsonError, HttpError } from "./_lib/auth.mjs";
 import { db } from "./_lib/db.mjs";
-import {
-  getCharacter,
-  ensureConversation,
-  getRecentMessages,
-  getRecentMemories,
-  markActivity,
-} from "./_lib/conversation.mjs";
-import { generateStructured } from "./_lib/gemini.mjs";
-import {
-  buildChatSystemInstruction,
-  chatResponseSchema,
-  renderTranscript,
-} from "./_lib/persona.mjs";
+import { getCharacter, ensureConversation } from "./_lib/conversation.mjs";
+import { syncCalendar, getActiveEvent } from "./_lib/calendar.mjs";
+import { deliverChatReply, deliverAckIfWarranted } from "./_lib/reply.mjs";
 
 const MAX_MESSAGE_LENGTH = 2000;
 
@@ -45,66 +35,36 @@ export default async (req, context) => {
       RETURNING *
     `;
 
-    const [history, memories] = await Promise.all([
-      getRecentMessages(conversation.id),
-      getRecentMemories(conversation.id),
-    ]);
+    // Response-session gating (spec §7-8): if the character is in a
+    // low-availability calendar event, don't generate the full reply now.
+    // At most send a short acknowledgment (only if this message seems
+    // urgent enough to warrant one), and leave the rest of the pending
+    // messages for the heartbeat to answer as one batched reply once the
+    // character is free again.
+    await syncCalendar(character.id);
+    const activeEvent = await getActiveEvent(character.id);
 
-    const systemInstruction = buildChatSystemInstruction({
-      character,
-      memories,
-      now: new Date().toLocaleString("en-US", { dateStyle: "full", timeStyle: "short" }),
-    });
-    const input = renderTranscript(history, character.name);
-
-    const aiResult = await generateStructured({
-      systemInstruction,
-      input,
-      schema: chatResponseSchema,
-    });
-
-    const outgoingMessages = Array.isArray(aiResult.messages)
-      ? aiResult.messages.filter((m) => typeof m === "string" && m.trim().length > 0)
-      : [];
-
-    const characterMessageRows = [];
-    for (const text of outgoingMessages) {
-      const [row] = await database.sql`
-        INSERT INTO messages (conversation_id, sender, content, origin)
-        VALUES (${conversation.id}, 'character', ${text.trim()}, 'chat')
-        RETURNING *
-      `;
-      characterMessageRows.push(row);
-    }
-
+    let characterMessageRows = [];
     let reaction = null;
-    if (aiResult.reaction_emoji) {
-      const [row] = await database.sql`
-        INSERT INTO reactions (message_id, reactor, emoji)
-        VALUES (${userMessageRow.id}, 'character', ${aiResult.reaction_emoji})
-        ON CONFLICT (message_id, reactor) DO UPDATE SET emoji = EXCLUDED.emoji
-        RETURNING *
-      `;
-      reaction = { messageId: String(row.message_id), emoji: row.emoji };
-    }
+    const busy = Boolean(activeEvent?.busy);
 
-    if (aiResult.new_memory) {
+    if (busy) {
+      const ack = await deliverAckIfWarranted({ character, conversation, activeEvent });
+      if (ack) characterMessageRows = [ack];
       await database.sql`
-        INSERT INTO memories (conversation_id, content)
-        VALUES (${conversation.id}, ${aiResult.new_memory})
+        UPDATE conversations SET last_activity_at = now() WHERE id = ${conversation.id}
       `;
+    } else {
+      const result = await deliverChatReply({ character, conversation });
+      characterMessageRows = result.characterMessageRows;
+      reaction = result.reaction;
     }
-
-    await database.sql`
-      UPDATE messages SET read_at = now()
-      WHERE conversation_id = ${conversation.id} AND sender = 'user' AND read_at IS NULL
-    `;
-    await markActivity(conversation.id);
 
     return Response.json({
       userMessage: serializeMessage(userMessageRow),
       characterMessages: characterMessageRows.map(serializeMessage),
       reaction,
+      busy,
     });
   } catch (error) {
     return jsonError(error);

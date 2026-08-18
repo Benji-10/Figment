@@ -86,6 +86,43 @@ export const SCHEMA_STATEMENTS = [
   },
   { text: `CREATE INDEX IF NOT EXISTS idx_memories_conversation ON memories(conversation_id, created_at DESC)` },
   {
+    text: `CREATE TABLE IF NOT EXISTS recurring_events (
+      id                  BIGSERIAL PRIMARY KEY,
+      character_id        INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+      slug                TEXT NOT NULL,
+      title               TEXT NOT NULL,
+      day_of_week         INTEGER NOT NULL CHECK (day_of_week BETWEEN 0 AND 6), -- 0 = Sunday
+      start_time_of_day   TIME NOT NULL,
+      end_time_of_day     TIME NOT NULL,
+      details             TEXT NOT NULL DEFAULT '',
+      location            TEXT,
+      busy                BOOLEAN NOT NULL DEFAULT false,
+      active              BOOLEAN NOT NULL DEFAULT true,
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (character_id, slug)
+    )`,
+  },
+  {
+    text: `CREATE TABLE IF NOT EXISTS calendar_events (
+      id                   BIGSERIAL PRIMARY KEY,
+      character_id         INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+      title                TEXT NOT NULL,
+      start_time           TIMESTAMPTZ NOT NULL,
+      end_time             TIMESTAMPTZ NOT NULL,
+      status               TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'active', 'completed', 'cancelled')),
+      location             TEXT,
+      details              TEXT NOT NULL DEFAULT '',
+      source               TEXT NOT NULL DEFAULT 'generated' CHECK (source IN ('recurring', 'planned', 'generated', 'inferred')),
+      busy                 BOOLEAN NOT NULL DEFAULT false,
+      recurring_event_id   BIGINT REFERENCES recurring_events(id) ON DELETE SET NULL,
+      recurrence_date      DATE,
+      created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (recurring_event_id, recurrence_date)
+    )`,
+  },
+  { text: `CREATE INDEX IF NOT EXISTS idx_calendar_events_character_time ON calendar_events(character_id, start_time)` },
+  {
     text: `INSERT INTO characters
       (slug, name, avatar_emoji, tagline, persona, communication_style, current_activity, current_mood)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -101,4 +138,49 @@ export const SCHEMA_STATEMENTS = [
       "pretty relaxed, a little tired",
     ],
   },
+  // Seed a believable weekly rhythm for Sam. Recurring templates are
+  // materialized into concrete calendar_events by ensureCalendar()
+  // (see _lib/calendar.mjs) — nothing else needs to run these.
+  ...seedRecurringEvent("seminar-mon", "Methods seminar", 1, "10:00", "11:30", {
+    details: "a required grad seminar, kind of dry but the prof notices who skips",
+    location: "Social Sciences building",
+    busy: true,
+  }),
+  ...seedRecurringEvent("seminar-wed", "Methods seminar", 3, "10:00", "11:30", {
+    details: "a required grad seminar, kind of dry but the prof notices who skips",
+    location: "Social Sciences building",
+    busy: true,
+  }),
+  ...seedRecurringEvent("seminar-fri", "Methods seminar", 5, "10:00", "11:30", {
+    details: "a required grad seminar, kind of dry but the prof notices who skips",
+    location: "Social Sciences building",
+    busy: true,
+  }),
+  ...seedRecurringEvent("shift-tue", "coffee shop shift", 2, "14:00", "18:30", {
+    details: "part-time barista shift, decent tips, exhausting on your feet by the end",
+    location: "the cafe",
+    busy: true,
+  }),
+  ...seedRecurringEvent("shift-thu", "coffee shop shift", 4, "14:00", "18:30", {
+    details: "part-time barista shift, decent tips, exhausting on your feet by the end",
+    location: "the cafe",
+    busy: true,
+  }),
+  ...seedRecurringEvent("family-call-sun", "family call", 0, "19:00", "19:30", {
+    details: "weekly call with mom, sometimes runs long, easy to text through",
+    location: null,
+    busy: false,
+  }),
 ];
+
+function seedRecurringEvent(slug, title, dayOfWeek, startTime, endTime, { details, location, busy }) {
+  return [
+    {
+      text: `INSERT INTO recurring_events
+        (character_id, slug, title, day_of_week, start_time_of_day, end_time_of_day, details, location, busy)
+        VALUES ((SELECT id FROM characters WHERE slug = $1), $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (character_id, slug) DO NOTHING`,
+      params: ["sam", slug, title, dayOfWeek, startTime, endTime, details || "", location || null, !!busy],
+    },
+  ];
+}

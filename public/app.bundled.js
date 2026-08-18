@@ -1098,6 +1098,7 @@ var state = {
   replyTarget: null,
   // { id, snippet }
   pollTimer: null,
+  headerTimer: null,
   lastPolledId: null
 };
 var el = (id) => document.getElementById(id);
@@ -1193,7 +1194,10 @@ function renderHeader(character) {
   el("character-avatar").textContent = character.avatarEmoji || "\u{1F642}";
   el("character-name").textContent = character.name;
   el("status-text").textContent = character.currentActivity || "around";
-  el("status-dot").classList.add("active");
+  const dot = el("status-dot");
+  const isBusy = Boolean(character.busy);
+  dot.classList.toggle("active", !isBusy);
+  dot.classList.toggle("busy", isBusy);
 }
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -1435,20 +1439,39 @@ function startPolling() {
   stopPolling();
   state.lastPolledId = latestMessageId();
   state.pollTimer = setInterval(pollForNewMessages, 7e3);
+  state.headerTimer = setInterval(refreshHeader, 6e4);
   document.addEventListener("visibilitychange", handleVisibility);
 }
 function stopPolling() {
   if (state.pollTimer) clearInterval(state.pollTimer);
+  if (state.headerTimer) clearInterval(state.headerTimer);
   state.pollTimer = null;
+  state.headerTimer = null;
   document.removeEventListener("visibilitychange", handleVisibility);
 }
 function handleVisibility() {
   if (document.hidden) {
     if (state.pollTimer) clearInterval(state.pollTimer);
+    if (state.headerTimer) clearInterval(state.headerTimer);
     state.pollTimer = null;
+    state.headerTimer = null;
   } else if (!state.pollTimer) {
     pollForNewMessages();
+    refreshHeader();
     state.pollTimer = setInterval(pollForNewMessages, 7e3);
+    state.headerTimer = setInterval(refreshHeader, 6e4);
+  }
+}
+async function refreshHeader() {
+  try {
+    const me = await api("/api/me");
+    state.character = me.character;
+    renderHeader(me.character);
+  } catch (err) {
+    if (err.status === 401) {
+      stopPolling();
+      showAuth();
+    }
   }
 }
 async function pollForNewMessages() {

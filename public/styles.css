@@ -234,6 +234,10 @@ body {
   animation: pulse 2.4s ease-out infinite;
 }
 
+.status-dot.busy {
+  background: var(--accent-2);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .status-dot.active { animation: none; }
 }

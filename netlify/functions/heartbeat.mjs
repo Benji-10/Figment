@@ -1,21 +1,22 @@
-// Runs on a schedule (see `config.schedule` below) and gives the
-// character a chance to spontaneously text users who've talked to it
-// recently — the "life continues even when you're not chatting" half of
-// the build spec. Most runs should be a no-op for most conversations;
-// the model is explicitly told that in `buildHeartbeatSystemInstruction`.
+// Runs on a schedule (see `config.schedule` below). Each candidate
+// conversation gets one of three treatments:
+//
+//   1. Unread user messages are waiting AND the character is free right
+//      now  -> deliver one batched reply covering all of them at once
+//      (the "response session" from spec §8 — several messages sent
+//      while the character was busy get answered together, not one at a
+//      time).
+//   2. Unread messages are waiting but the character is still busy
+//      -> do nothing yet, check again next run.
+//   3. Nothing pending -> the normal spontaneous "life continues"
+//      check-in (spec §12), skipped entirely while busy.
 //
 // Netlify scheduled functions have a 30s execution budget, so we only
-// look at a small batch of the most recently active conversations per
-// run rather than the whole table.
+// look at a small batch of the most recently active conversations per run.
 
 import { db, ensureSchema } from "./_lib/db.mjs";
-import { getRecentMessages, getRecentMemories } from "./_lib/conversation.mjs";
-import { generateStructured } from "./_lib/gemini.mjs";
-import {
-  buildHeartbeatSystemInstruction,
-  heartbeatResponseSchema,
-  renderTranscript,
-} from "./_lib/persona.mjs";
+import { getActiveEvent } from "./_lib/calendar.mjs";
+import { deliverChatReply, deliverSpontaneousCheck } from "./_lib/reply.mjs";
 
 const BATCH_SIZE = 5;
 const MIN_GAP_MINUTES = 25; // don't re-check the same conversation more often than this
@@ -28,8 +29,10 @@ export default async (req) => {
   const activeWindow = `${ACTIVE_WINDOW_DAYS} days`;
   const minGap = `${MIN_GAP_MINUTES} minutes`;
 
+  // ch.* first so the character's own `id` isn't shadowed by the
+  // conversation's `id` — the aliased conversation_* columns come after.
   const candidates = await database.sql`
-    SELECT c.id AS conversation_id, ch.*
+    SELECT ch.*, c.id AS conversation_id, c.user_id AS conversation_user_id, c.state AS conversation_state
     FROM conversations c
     JOIN characters ch ON ch.id = c.character_id
     WHERE c.last_activity_at > now() - ${activeWindow}::interval
@@ -41,57 +44,51 @@ export default async (req) => {
   const results = [];
 
   for (const row of candidates) {
-    const conversationId = row.conversation_id;
+    const character = row;
+    const conversation = {
+      id: row.conversation_id,
+      user_id: row.conversation_user_id,
+      state: row.conversation_state,
+    };
+
     try {
-      const [history, memories] = await Promise.all([
-        getRecentMessages(conversationId, 12),
-        getRecentMemories(conversationId),
-      ]);
+      const [{ count }] = await database.sql`
+        SELECT count(*)::int AS count FROM messages
+        WHERE conversation_id = ${conversation.id} AND sender = 'user' AND read_at IS NULL
+      `;
 
-      const systemInstruction = buildHeartbeatSystemInstruction({
-        character: row,
-        memories,
-        now: new Date().toLocaleString("en-US", { dateStyle: "full", timeStyle: "short" }),
-      });
-      const input = renderTranscript(history, row.name);
-
-      const aiResult = await generateStructured({
-        systemInstruction,
-        input,
-        schema: heartbeatResponseSchema,
-      });
-
-      const outgoing = Array.isArray(aiResult.messages)
-        ? aiResult.messages.filter((m) => typeof m === "string" && m.trim().length > 0)
-        : [];
-
-      if (aiResult.should_message && outgoing.length > 0) {
-        for (const text of outgoing) {
+      if (count > 0) {
+        const activeEvent = await getActiveEvent(character.id);
+        if (activeEvent?.busy) {
           await database.sql`
-            INSERT INTO messages (conversation_id, sender, content, origin)
-            VALUES (${conversationId}, 'character', ${text.trim()}, 'heartbeat')
+            UPDATE conversations SET last_heartbeat_at = now() WHERE id = ${conversation.id}
           `;
+          results.push({ conversationId: conversation.id, outcome: "waiting_busy", pending: count });
+        } else {
+          const { characterMessageRows } = await deliverChatReply({ character, conversation });
+          results.push({
+            conversationId: conversation.id,
+            outcome: "batched_reply",
+            pending: count,
+            sent: characterMessageRows.length,
+          });
         }
-        await database.sql`
-          UPDATE conversations
-          SET last_activity_at = now(), last_heartbeat_at = now(), state = 'active'
-          WHERE id = ${conversationId}
-        `;
-        results.push({ conversationId, messaged: true, count: outgoing.length });
       } else {
-        await database.sql`
-          UPDATE conversations SET last_heartbeat_at = now() WHERE id = ${conversationId}
-        `;
-        results.push({ conversationId, messaged: false });
+        const outcome = await deliverSpontaneousCheck({ character, conversation });
+        results.push({
+          conversationId: conversation.id,
+          outcome: outcome.messaged ? "spontaneous" : outcome.reason || "quiet",
+          sent: outcome.count || 0,
+        });
       }
     } catch (error) {
-      console.error(`Heartbeat failed for conversation ${conversationId}:`, error);
+      console.error(`Heartbeat failed for conversation ${conversation.id}:`, error);
       // Still bump last_heartbeat_at so a persistently-failing conversation
       // (e.g. bad state) doesn't get retried every single run.
       await database.sql`
-        UPDATE conversations SET last_heartbeat_at = now() WHERE id = ${conversationId}
+        UPDATE conversations SET last_heartbeat_at = now() WHERE id = ${conversation.id}
       `.catch(() => {});
-      results.push({ conversationId, error: String(error.message || error) });
+      results.push({ conversationId: conversation.id, error: String(error.message || error) });
     }
   }
 
