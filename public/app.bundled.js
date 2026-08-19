@@ -1099,7 +1099,9 @@ var state = {
   // { id, snippet }
   pollTimer: null,
   headerTimer: null,
-  lastPolledId: null
+  lastPolledId: null,
+  revealing: false
+  // true while a typing-reveal animation is in progress
 };
 var el = (id) => document.getElementById(id);
 async function boot() {
@@ -1249,6 +1251,9 @@ function dateSeparator(iso) {
 function findMessage(id) {
   return state.messages.find((m) => m.id === id);
 }
+function hasMessage(id) {
+  return state.messages.some((m) => m.id === id);
+}
 function messageRow(msg, grouped) {
   const row = document.createElement("div");
   row.className = `msg-row from-${msg.sender}${grouped ? " grouped" : ""}`;
@@ -1342,8 +1347,9 @@ el("composer").addEventListener("submit", async (e) => {
     }
     renderAllMessages();
     scrollToBottom();
+    const lastOfExchange = result.characterMessages.length > 0 ? result.characterMessages[result.characterMessages.length - 1] : result.userMessage;
+    state.lastPolledId = lastOfExchange.id;
     await revealCharacterMessages(result.characterMessages);
-    state.lastPolledId = latestMessageId();
   } catch (err) {
     console.error(err);
     const idx = state.messages.findIndex((m) => m.id === tempId);
@@ -1354,15 +1360,25 @@ el("composer").addEventListener("submit", async (e) => {
   }
 });
 async function revealCharacterMessages(messages) {
-  for (const msg of messages) {
-    const typingMs = Math.min(3200, 450 + msg.content.length * 28);
-    el("typing-indicator").hidden = false;
-    scrollToBottom();
-    await sleep(typingMs);
+  const newOnes = messages.filter((m) => !hasMessage(m.id));
+  if (newOnes.length === 0) return;
+  state.revealing = true;
+  try {
+    for (const msg of newOnes) {
+      if (hasMessage(msg.id)) continue;
+      const typingMs = Math.min(3200, 450 + msg.content.length * 28);
+      el("typing-indicator").hidden = false;
+      scrollToBottom();
+      await sleep(typingMs);
+      el("typing-indicator").hidden = true;
+      if (hasMessage(msg.id)) continue;
+      state.messages.push(msg);
+      renderAllMessages();
+      scrollToBottom();
+    }
+  } finally {
+    state.revealing = false;
     el("typing-indicator").hidden = true;
-    state.messages.push(msg);
-    renderAllMessages();
-    scrollToBottom();
   }
 }
 function sleep(ms) {
@@ -1385,9 +1401,10 @@ function clearReplyPreview() {
 el("reply-preview-cancel").addEventListener("click", clearReplyPreview);
 var pressTimer = null;
 function attachRowInteractions(row, msg) {
-  const start = () => {
+  const start = (e) => {
+    if (e.button != null && e.button !== 0) return;
     pressTimer = setTimeout(() => {
-      openReactionPicker(row, msg);
+      openMessageActions(row, msg);
       pressTimer = null;
     }, 420);
   };
@@ -1399,10 +1416,10 @@ function attachRowInteractions(row, msg) {
   row.addEventListener("pointerup", cancel);
   row.addEventListener("pointerleave", cancel);
   row.addEventListener("pointercancel", cancel);
-  row.addEventListener("dblclick", () => setReplyTarget(msg));
 }
-function openReactionPicker(row, msg) {
+function openMessageActions(row, msg) {
   const picker = el("reaction-picker");
+  const replyBtn = el("picker-reply-btn");
   const rect = row.getBoundingClientRect();
   picker.hidden = false;
   picker.style.left = `${Math.min(
@@ -1410,11 +1427,16 @@ function openReactionPicker(row, msg) {
     window.innerWidth - picker.offsetWidth - 12
   )}px`;
   picker.style.top = `${rect.top - 52}px`;
+  function closePicker() {
+    picker.hidden = true;
+    picker.removeEventListener("click", onPick);
+    replyBtn.removeEventListener("click", onReply);
+    document.removeEventListener("pointerdown", dismiss, true);
+  }
   const onPick = async (e) => {
     const btn = e.target.closest("button[data-emoji]");
     if (!btn) return;
-    picker.hidden = true;
-    picker.removeEventListener("click", onPick);
+    closePicker();
     try {
       const result = await api("/api/react", {
         method: "POST",
@@ -1426,13 +1448,15 @@ function openReactionPicker(row, msg) {
       console.error(err);
     }
   };
-  picker.addEventListener("click", onPick);
-  const dismiss = (e) => {
-    if (!picker.contains(e.target)) {
-      picker.hidden = true;
-      document.removeEventListener("pointerdown", dismiss, true);
-    }
+  const onReply = () => {
+    closePicker();
+    setReplyTarget(msg);
   };
+  const dismiss = (e) => {
+    if (!picker.contains(e.target)) closePicker();
+  };
+  picker.addEventListener("click", onPick);
+  replyBtn.addEventListener("click", onReply);
   setTimeout(() => document.addEventListener("pointerdown", dismiss, true), 0);
 }
 function startPolling() {
@@ -1475,20 +1499,24 @@ async function refreshHeader() {
   }
 }
 async function pollForNewMessages() {
-  if (!state.lastPolledId) return;
+  if (!state.lastPolledId || state.revealing) return;
   try {
     const data = await api(`/api/messages?after_id=${encodeURIComponent(state.lastPolledId)}`);
     if (data.messages.length === 0) return;
-    const characterOnly = data.messages.filter((m) => m.sender === "character");
-    const userEchoes = data.messages.filter((m) => m.sender === "user");
-    for (const m of userEchoes) state.messages.push(m);
+    state.lastPolledId = data.messages[data.messages.length - 1].id;
+    const newMessages = data.messages.filter((m) => !hasMessage(m.id));
+    if (newMessages.length === 0) return;
+    const characterOnly = newMessages.filter((m) => m.sender === "character");
+    const userEchoes = newMessages.filter((m) => m.sender === "user");
+    for (const m of userEchoes) {
+      if (!hasMessage(m.id)) state.messages.push(m);
+    }
     if (characterOnly.length > 0) {
       await revealCharacterMessages(characterOnly);
     } else if (userEchoes.length > 0) {
       renderAllMessages();
       scrollToBottom();
     }
-    state.lastPolledId = latestMessageId();
   } catch (err) {
     if (err.status === 401) {
       stopPolling();

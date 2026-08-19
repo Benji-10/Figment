@@ -87,7 +87,7 @@
 
   </div>
 
-  <!-- Reusable reaction picker, positioned via JS -->
+  <!-- Reusable message action menu (react + reply), positioned via JS -->
   <div id="reaction-picker" class="reaction-picker" hidden role="menu">
     <button data-emoji="❤️" role="menuitem">❤️</button>
     <button data-emoji="😂" role="menuitem">😂</button>
@@ -95,6 +95,10 @@
     <button data-emoji="😢" role="menuitem">😢</button>
     <button data-emoji="👍" role="menuitem">👍</button>
     <button data-emoji="🔥" role="menuitem">🔥</button>
+    <span class="picker-divider" aria-hidden="true"></span>
+    <button id="picker-reply-btn" class="picker-reply-btn" role="menuitem" aria-label="Reply">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+    </button>
   </div>
 
   <script type="module" src="app.bundled.js"></script>

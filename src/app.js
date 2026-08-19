@@ -16,6 +16,7 @@ const state = {
   pollTimer: null,
   headerTimer: null,
   lastPolledId: null,
+  revealing: false, // true while a typing-reveal animation is in progress
 };
 
 const el = (id) => document.getElementById(id);
@@ -200,6 +201,10 @@ function findMessage(id) {
   return state.messages.find((m) => m.id === id);
 }
 
+function hasMessage(id) {
+  return state.messages.some((m) => m.id === id);
+}
+
 function messageRow(msg, grouped) {
   const row = document.createElement("div");
   row.className = `msg-row from-${msg.sender}${grouped ? " grouped" : ""}`;
@@ -318,8 +323,17 @@ el("composer").addEventListener("submit", async (e) => {
     renderAllMessages();
     scrollToBottom();
 
+    // Mark these as already-seen right away — before the animated reveal
+    // below, which can take several seconds. Otherwise a poll tick firing
+    // mid-reveal would see them as "new" (they're already in the DB) and
+    // duplicate them.
+    const lastOfExchange =
+      result.characterMessages.length > 0
+        ? result.characterMessages[result.characterMessages.length - 1]
+        : result.userMessage;
+    state.lastPolledId = lastOfExchange.id;
+
     await revealCharacterMessages(result.characterMessages);
-    state.lastPolledId = latestMessageId();
   } catch (err) {
     console.error(err);
     const idx = state.messages.findIndex((m) => m.id === tempId);
@@ -331,16 +345,27 @@ el("composer").addEventListener("submit", async (e) => {
 });
 
 async function revealCharacterMessages(messages) {
-  for (const msg of messages) {
-    const typingMs = Math.min(3200, 450 + msg.content.length * 28);
-    el("typing-indicator").hidden = false;
-    scrollToBottom();
-    await sleep(typingMs);
-    el("typing-indicator").hidden = true;
+  const newOnes = messages.filter((m) => !hasMessage(m.id));
+  if (newOnes.length === 0) return;
 
-    state.messages.push(msg);
-    renderAllMessages();
-    scrollToBottom();
+  state.revealing = true;
+  try {
+    for (const msg of newOnes) {
+      if (hasMessage(msg.id)) continue; // could've arrived via another path mid-loop
+      const typingMs = Math.min(3200, 450 + msg.content.length * 28);
+      el("typing-indicator").hidden = false;
+      scrollToBottom();
+      await sleep(typingMs);
+      el("typing-indicator").hidden = true;
+
+      if (hasMessage(msg.id)) continue;
+      state.messages.push(msg);
+      renderAllMessages();
+      scrollToBottom();
+    }
+  } finally {
+    state.revealing = false;
+    el("typing-indicator").hidden = true;
   }
 }
 
@@ -369,14 +394,16 @@ function clearReplyPreview() {
 
 el("reply-preview-cancel").addEventListener("click", clearReplyPreview);
 
-/* ===================== Reactions & reply trigger (long-press) ===================== */
+/* ===================== Reactions & reply (unified long-press menu) ===================== */
 
 let pressTimer = null;
 
 function attachRowInteractions(row, msg) {
-  const start = () => {
+  const start = (e) => {
+    // Ignore multi-touch (pinch-zoom gestures) and non-primary buttons.
+    if (e.button != null && e.button !== 0) return;
     pressTimer = setTimeout(() => {
-      openReactionPicker(row, msg);
+      openMessageActions(row, msg);
       pressTimer = null;
     }, 420);
   };
@@ -389,14 +416,13 @@ function attachRowInteractions(row, msg) {
   row.addEventListener("pointerup", cancel);
   row.addEventListener("pointerleave", cancel);
   row.addEventListener("pointercancel", cancel);
-
-  // Desktop convenience: double-click to reply.
-  row.addEventListener("dblclick", () => setReplyTarget(msg));
 }
 
-function openReactionPicker(row, msg) {
+function openMessageActions(row, msg) {
   const picker = el("reaction-picker");
+  const replyBtn = el("picker-reply-btn");
   const rect = row.getBoundingClientRect();
+
   picker.hidden = false;
   picker.style.left = `${Math.min(
     Math.max(rect.left, 12),
@@ -404,11 +430,17 @@ function openReactionPicker(row, msg) {
   )}px`;
   picker.style.top = `${rect.top - 52}px`;
 
+  function closePicker() {
+    picker.hidden = true;
+    picker.removeEventListener("click", onPick);
+    replyBtn.removeEventListener("click", onReply);
+    document.removeEventListener("pointerdown", dismiss, true);
+  }
+
   const onPick = async (e) => {
     const btn = e.target.closest("button[data-emoji]");
     if (!btn) return;
-    picker.hidden = true;
-    picker.removeEventListener("click", onPick);
+    closePicker();
     try {
       const result = await api("/api/react", {
         method: "POST",
@@ -420,14 +452,18 @@ function openReactionPicker(row, msg) {
       console.error(err);
     }
   };
-  picker.addEventListener("click", onPick);
+
+  const onReply = () => {
+    closePicker();
+    setReplyTarget(msg);
+  };
 
   const dismiss = (e) => {
-    if (!picker.contains(e.target)) {
-      picker.hidden = true;
-      document.removeEventListener("pointerdown", dismiss, true);
-    }
+    if (!picker.contains(e.target)) closePicker();
   };
+
+  picker.addEventListener("click", onPick);
+  replyBtn.addEventListener("click", onReply);
   setTimeout(() => document.addEventListener("pointerdown", dismiss, true), 0);
 }
 
@@ -477,14 +513,23 @@ async function refreshHeader() {
 }
 
 async function pollForNewMessages() {
-  if (!state.lastPolledId) return;
+  if (!state.lastPolledId || state.revealing) return;
   try {
     const data = await api(`/api/messages?after_id=${encodeURIComponent(state.lastPolledId)}`);
     if (data.messages.length === 0) return;
 
-    const characterOnly = data.messages.filter((m) => m.sender === "character");
-    const userEchoes = data.messages.filter((m) => m.sender === "user");
-    for (const m of userEchoes) state.messages.push(m); // rare: sent from another tab/device
+    // Always advance the cursor to the tail of what the server returned,
+    // even for messages we filter out below, so we don't re-fetch them.
+    state.lastPolledId = data.messages[data.messages.length - 1].id;
+
+    const newMessages = data.messages.filter((m) => !hasMessage(m.id));
+    if (newMessages.length === 0) return;
+
+    const characterOnly = newMessages.filter((m) => m.sender === "character");
+    const userEchoes = newMessages.filter((m) => m.sender === "user");
+    for (const m of userEchoes) {
+      if (!hasMessage(m.id)) state.messages.push(m); // rare: sent from another tab/device
+    }
 
     if (characterOnly.length > 0) {
       await revealCharacterMessages(characterOnly);
@@ -492,7 +537,6 @@ async function pollForNewMessages() {
       renderAllMessages();
       scrollToBottom();
     }
-    state.lastPolledId = latestMessageId();
   } catch (err) {
     if (err.status === 401) {
       stopPolling();

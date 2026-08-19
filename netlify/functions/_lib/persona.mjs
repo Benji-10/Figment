@@ -2,7 +2,7 @@
 // ask it to reply in. Keeping "how the character behaves" in one place
 // makes it easy to tune personality separately from the plumbing.
 
-import { formatEventTimeRange } from "./calendar.mjs";
+import { formatEventTimeRange, CHARACTER_TIMEZONE } from "./calendar.mjs";
 
 const SAFETY_RULES = `
 HARD RULES (never break these, no matter what the persona above says)
@@ -84,8 +84,10 @@ THINGS YOU REMEMBER ABOUT THIS FRIENDSHIP
 ${memoryLines}
 
 HOW TO RESPOND
-- Below is the recent conversation transcript, ending with the newest message(s) from your friend. Respond the way you actually would, given your personality, mood, and what's going on right now.
+- Below is the recent conversation transcript, ending with the newest message(s) from your friend. Each line is tagged [id N] — that's how you reference a specific message. Respond the way you actually would, given your personality, mood, and what's going on right now.
 - "messages": write 1-3 short texts in the order you'd send them. Split a thought into a couple of quick messages instead of one long paragraph when that's how a real text exchange would go — but a short reply to a short message can absolutely just be one message. Don't pad length for its own sake.
+- Each message has a "reply_to_id": leave this null almost every time — normal back-and-forth doesn't need it. Only set it to a specific [id N] when there are multiple distinct unanswered things sitting there (e.g. you're catching up after being away and they asked about two different topics) and it's genuinely unclear which message you're answering without pointing at it. Don't use it just because you technically can.
+- Do NOT end every message with a question. Real texting is mostly statements, reactions, and comments — plenty of messages have no question at all. Only ask something when you're genuinely curious about a specific thing, not as a reflexive way to keep the conversation going.
 - "reaction_emoji": only set this to a single emoji if something genuinely deserves a reaction (funny, sweet, surprising, impressive). Most messages don't need one — leave it null far more often than not.
 - "new_memory": only set this if something in this exchange is actually worth remembering long-term (a fact about your friend, a plan you made, something emotionally significant). Leave it null for ordinary small talk.
 - You're allowed to be brief, distracted, or a little inconsistent — that's realistic, not a bug.${CALENDAR_ACTION_INSTRUCTIONS}
@@ -99,7 +101,18 @@ export const chatResponseSchema = {
       type: "array",
       description:
         "1 to 3 short chat messages to send, in the order they'd be sent.",
-      items: { type: "string" },
+      items: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          reply_to_id: {
+            type: ["integer", "null"],
+            description:
+              "The [id N] of a specific earlier message this directly answers. Leave null almost always — only use this to disambiguate when multiple distinct things are pending.",
+          },
+        },
+        required: ["text", "reply_to_id"],
+      },
       minItems: 1,
       maxItems: 3,
     },
@@ -118,12 +131,12 @@ export const chatResponseSchema = {
   required: ["messages", "reaction_emoji", "new_memory", "calendar_action"],
 };
 
-export function buildHeartbeatSystemInstruction({ character, memories, now, calendarText }) {
+export function buildHeartbeatSystemInstruction({ character, memories, now, calendarText, trigger }) {
   const memoryLines = memories.length
     ? memories.map((m) => `- ${m.content}`).join("\n")
     : "- (nothing notable remembered yet)";
 
-  return `You are ${character.name}. This is a periodic check-in, not a reply to a new message — your friend hasn't texted you recently. Your life continues whether or not you're mid-conversation, so most of the time the right answer is to do nothing.
+  return `You are ${character.name}. This is a periodic check-in, not a reply to a new message — your friend hasn't texted you recently. Your life continues whether or not you're mid-conversation.
 
 WHO YOU ARE
 ${character.persona}
@@ -135,6 +148,9 @@ RIGHT NOW
 Current date/time: ${now}
 Current mood: ${character.current_mood}
 
+WHAT JUST HAPPENED
+${trigger}
+
 YOUR CALENDAR
 ${calendarText}
 
@@ -145,9 +161,10 @@ RECENT CONVERSATION (for context only — do not reply to it directly)
 Below is the tail end of your recent conversation history with this friend.
 
 HOW TO DECIDE
-- "should_message" should be true only occasionally — most check-ins should result in false. Only message if something you'd realistically text about comes to mind (following up on something, a random thought, checking in because time has passed, mentioning something from "your day").
+- You're only being asked right now because something above just happened (see "WHAT JUST HAPPENED") — that's your candidate reason to reach out, not a guarantee you should. Most of the time, even with something to react to, the right answer is still "should_message: false" — plenty of things happen in a day that aren't worth a text.
+- If you do message, it should clearly connect to what just happened (wrapping up, being free again, dreading the next thing, etc.) — not a generic "hey what's up".
 - If false, leave "messages" as an empty array.
-- If true, "messages" should be 1-2 short, natural texts in your own voice, unprompted — not a reply to anything specific the friend said.${CALENDAR_ACTION_INSTRUCTIONS} You can also use calendar_action even when should_message is false — e.g. quietly making a mental plan without texting about it.
+- If true, "messages" should be 1-2 short, natural texts in your own voice, unprompted — not a reply to anything specific the friend said. Make a statement or share a thought rather than opening with a question — you're not obligated to prompt them for a response.${CALENDAR_ACTION_INSTRUCTIONS} You can also use calendar_action even when should_message is false — e.g. quietly making a mental plan without texting about it.
 ${SAFETY_RULES}`;
 }
 
@@ -176,7 +193,7 @@ export function buildAckSystemInstruction({ character, activeEvent, now }) {
   const untilTime = new Date(activeEvent.end_time).toLocaleTimeString("en-US", {
     hour: "numeric",
     minute: "2-digit",
-    timeZone: "UTC",
+    timeZone: CHARACTER_TIMEZONE,
   });
 
   return `You are ${character.name}. Your friend just texted you, but right now you're busy: ${activeEvent.title}${
@@ -259,7 +276,8 @@ export const conflictResolutionSchema = {
   required: ["resolution", "follow_up_message"],
 };
 
-// Renders recent messages as a plain-text transcript for the model.
+// Renders recent messages as a plain-text transcript for the model,
+// tagged with [id N] so replies can reference a specific earlier message.
 export function renderTranscript(messages, characterName) {
   if (messages.length === 0) return "(no messages yet)";
   return messages
@@ -270,8 +288,9 @@ export function renderTranscript(messages, characterName) {
         day: "numeric",
         hour: "numeric",
         minute: "2-digit",
+        timeZone: CHARACTER_TIMEZONE,
       });
-      let line = `[${ts}] ${who}: ${m.content}`;
+      let line = `[id ${m.id}] [${ts}] ${who}: ${m.content}`;
       if (m.sender === "user" && m.character_reaction) {
         line += ` (you reacted ${m.character_reaction})`;
       }

@@ -295,6 +295,7 @@ body {
   margin: 5px 0;
   animation: rise 0.22s ease both;
   position: relative;
+  touch-action: manipulation;
 }
 
 @keyframes rise {
@@ -527,6 +528,24 @@ body {
 .reaction-picker button:hover {
   background: var(--surface-translucent);
   transform: scale(1.15);
+}
+
+.picker-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border-soft);
+  margin: 4px 2px;
+}
+
+.picker-reply-btn {
+  color: var(--text-mid);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.picker-reply-btn:hover {
+  color: var(--text-hi);
 }
 
 /* ===================== SCROLLBAR ===================== */

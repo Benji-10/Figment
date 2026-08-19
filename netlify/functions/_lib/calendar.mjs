@@ -4,56 +4,117 @@
 // cancel/extend) through structured output, which this module validates
 // and applies. See persona.mjs for the schema the model fills in, and
 // reply.mjs for how a detected conflict gets resolved.
-//
-// Simplification: there's no per-character timezone modeling — all times
-// are treated as a single implicit "wall clock" (UTC). Fine for a basic
-// build; a real deployment would want a timezone per character.
 
 import { db } from "./db.mjs";
 
 const MATERIALIZE_WINDOW_DAYS = 4; // how far ahead recurring events get generated
 const UPCOMING_LIMIT = 6;
 
-/* ===================== Time helpers ===================== */
+// The character's own timezone — "2pm" in a recurring event means 2pm
+// here, not 2pm UTC. Override with CHARACTER_TIMEZONE if you deploy this
+// somewhere else. Must be a valid IANA zone name.
+export const CHARACTER_TIMEZONE = process.env.CHARACTER_TIMEZONE || "America/Chicago";
 
-function startOfUtcDay(date) {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+/* ===================== Timezone-aware time helpers ===================== */
+//
+// JS Date has no concept of "construct this wall-clock time in timezone
+// X" — only UTC or the server's own local zone. These helpers implement
+// the standard trick: format a UTC guess in the target zone, measure how
+// far off it read, and correct. DST-safe to within one extra pass at the
+// transition hour itself.
+
+function zonedYMD(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  })
+    .formatToParts(date)
+    .reduce((acc, p) => ((acc[p.type] = p.value), acc), {});
+  return { year: Number(parts.year), month: Number(parts.month), day: Number(parts.day) };
 }
 
-function addDays(date, days) {
-  const d = new Date(date);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d;
+// A calendar date, as a UTC-midnight instant used purely for day
+// arithmetic and day-of-week — never treated as an actual moment in time.
+function ymdAnchor({ year, month, day }) {
+  return new Date(Date.UTC(year, month - 1, day));
 }
 
-function combineDateAndTimeOfDay(date, timeOfDay) {
-  const [h, m, s] = String(timeOfDay).split(":").map(Number);
-  const d = new Date(date);
-  d.setUTCHours(h, m, s || 0, 0);
-  return d;
+function addDaysToYMD(ymd, days) {
+  const anchor = ymdAnchor(ymd);
+  anchor.setUTCDate(anchor.getUTCDate() + days);
+  return { year: anchor.getUTCFullYear(), month: anchor.getUTCMonth() + 1, day: anchor.getUTCDate() };
 }
 
-// Turns the model's { day_offset, start_hour, start_minute } into a Date,
-// relative to "today" at UTC midnight.
+function dayOfWeekForYMD(ymd) {
+  return ymdAnchor(ymd).getUTCDay();
+}
+
+function timeZoneOffsetMs(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  })
+    .formatToParts(date)
+    .reduce((acc, p) => ((acc[p.type] = p.value), acc), {});
+  const asUtc = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour) === 24 ? 0 : Number(parts.hour),
+    Number(parts.minute),
+    Number(parts.second)
+  );
+  return asUtc - date.getTime();
+}
+
+// The actual UTC instant for "HH:MM on this Y-M-D, as read on a clock in
+// `timeZone`" — e.g. (2026, 8, 19, 14, 0, "America/Chicago") → the UTC
+// timestamp that displays as 2:00 PM in Chicago that day.
+function zonedWallTimeToUtc(year, month, day, hour, minute, timeZone) {
+  const guess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+  const offset = timeZoneOffsetMs(guess, timeZone);
+  let corrected = new Date(guess.getTime() - offset);
+  const offset2 = timeZoneOffsetMs(corrected, timeZone);
+  if (offset2 !== offset) corrected = new Date(guess.getTime() - offset2);
+  return corrected;
+}
+
+// Turns the model's { day_offset, hour, minute } into a real UTC Date,
+// where day_offset is relative to "today" in the character's own
+// timezone (0 = today, 1 = tomorrow, ...).
 export function resolveDateTime(dayOffset, hour, minute, referenceNow = new Date()) {
-  const base = startOfUtcDay(referenceNow);
-  base.setUTCDate(base.getUTCDate() + dayOffset);
-  base.setUTCHours(hour, minute, 0, 0);
-  return base;
+  const targetYmd = addDaysToYMD(zonedYMD(referenceNow, CHARACTER_TIMEZONE), dayOffset);
+  return zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, hour, minute, CHARACTER_TIMEZONE);
 }
 
 function describeDay(date, now) {
-  const diffDays = Math.round(
-    (startOfUtcDay(date).getTime() - startOfUtcDay(now).getTime()) / 86400000
+  const dayDiff = Math.round(
+    (ymdAnchor(zonedYMD(date, CHARACTER_TIMEZONE)).getTime() -
+      ymdAnchor(zonedYMD(now, CHARACTER_TIMEZONE)).getTime()) /
+      86400000
   );
-  if (diffDays === 0) return "Today";
-  if (diffDays === 1) return "Tomorrow";
-  return date.toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" });
+  if (dayDiff === 0) return "Today";
+  if (dayDiff === 1) return "Tomorrow";
+  return date.toLocaleDateString("en-US", { weekday: "short", timeZone: CHARACTER_TIMEZONE });
 }
 
 function formatClockTime(isoOrDate) {
   const d = new Date(isoOrDate);
-  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "UTC" });
+  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: CHARACTER_TIMEZONE });
+}
+
+// "Full weekday, month day, year, time" in the character's own timezone —
+// what gets shown to the model as "current date/time".
+export function formatNowLabel(date = new Date()) {
+  return date.toLocaleString("en-US", { dateStyle: "full", timeStyle: "short", timeZone: CHARACTER_TIMEZONE });
 }
 
 export function formatEventTimeRange(event, now) {
@@ -87,21 +148,23 @@ const toPositiveInt = (v) => {
 export async function syncCalendar(characterId) {
   const database = db();
   const now = new Date();
-  const today = startOfUtcDay(now);
+  const todayYmd = zonedYMD(now, CHARACTER_TIMEZONE);
 
   const templates = await database.sql`
     SELECT * FROM recurring_events WHERE character_id = ${characterId} AND active = true
   `;
 
   for (let offset = 0; offset < MATERIALIZE_WINDOW_DAYS; offset++) {
-    const targetDate = addDays(today, offset);
-    const targetDow = targetDate.getUTCDay();
-    const recurrenceDate = targetDate.toISOString().slice(0, 10);
+    const targetYmd = addDaysToYMD(todayYmd, offset);
+    const targetDow = dayOfWeekForYMD(targetYmd);
+    const recurrenceDate = `${targetYmd.year}-${String(targetYmd.month).padStart(2, "0")}-${String(targetYmd.day).padStart(2, "0")}`;
 
     for (const tpl of templates) {
       if (tpl.day_of_week !== targetDow) continue;
-      const startTime = combineDateAndTimeOfDay(targetDate, tpl.start_time_of_day);
-      const endTime = combineDateAndTimeOfDay(targetDate, tpl.end_time_of_day);
+      const [sh, sm] = String(tpl.start_time_of_day).split(":").map(Number);
+      const [eh, em] = String(tpl.end_time_of_day).split(":").map(Number);
+      const startTime = zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, sh, sm, CHARACTER_TIMEZONE);
+      const endTime = zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, eh, em, CHARACTER_TIMEZONE);
 
       await database.sql`
         INSERT INTO calendar_events
@@ -122,6 +185,22 @@ export async function syncCalendar(characterId) {
     UPDATE calendar_events SET status = 'completed', updated_at = now()
     WHERE character_id = ${characterId} AND status IN ('scheduled', 'active') AND end_time <= now()
   `;
+}
+
+// Which events for this character transitioned (started or ended) since
+// `since`? Used to gate spontaneous heartbeat messages on something
+// actually having happened, rather than firing on a timer regardless of
+// state — see reply.mjs's deliverSpontaneousCheck.
+export async function getRecentTransitions(characterId, since) {
+  const database = db();
+  const rows = await database.sql`
+    SELECT * FROM calendar_events
+    WHERE character_id = ${characterId}
+      AND status IN ('active', 'completed')
+      AND updated_at > ${since ? new Date(since).toISOString() : new Date(0).toISOString()}
+    ORDER BY updated_at DESC
+  `;
+  return rows;
 }
 
 export async function getActiveEvent(characterId) {

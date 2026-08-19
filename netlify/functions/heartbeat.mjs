@@ -32,7 +32,8 @@ export default async (req) => {
   // ch.* first so the character's own `id` isn't shadowed by the
   // conversation's `id` — the aliased conversation_* columns come after.
   const candidates = await database.sql`
-    SELECT ch.*, c.id AS conversation_id, c.user_id AS conversation_user_id, c.state AS conversation_state
+    SELECT ch.*, c.id AS conversation_id, c.user_id AS conversation_user_id,
+           c.state AS conversation_state, c.last_heartbeat_at AS conversation_last_heartbeat_at
     FROM conversations c
     JOIN characters ch ON ch.id = c.character_id
     WHERE c.last_activity_at > now() - ${activeWindow}::interval
@@ -49,6 +50,7 @@ export default async (req) => {
       id: row.conversation_id,
       user_id: row.conversation_user_id,
       state: row.conversation_state,
+      last_heartbeat_at: row.conversation_last_heartbeat_at,
     };
 
     try {

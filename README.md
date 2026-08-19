@@ -21,8 +21,10 @@ layered on without re-architecting anything.
   calendar — see below) — spec §2
 - **Calendar / event engine** (spec §3–4): recurring weekly events
   (seminar, work shift, family call) materialize into concrete dated
-  events automatically; the model can create/move/cancel/extend events
-  through structured output (`calendar_action`), validated and executed
+  events automatically, on a real IANA timezone (`CHARACTER_TIMEZONE`,
+  default `America/Chicago`) — "2pm" in the schedule means 2pm there, not
+  2pm UTC. The model can create/move/cancel/extend events through
+  structured output (`calendar_action`), validated and executed
   deterministically by the app. Overlapping creates/moves are caught
   before they're applied — the app detects the conflict, asks the model
   in-character how it wants to resolve it (keep the new plan and cancel
@@ -36,12 +38,16 @@ layered on without re-architecting anything.
   acknowledgment (only if the app's quick urgency check thinks it's worth
   interrupting for), and the actual reply is deferred. Multiple messages
   sent during that window all get answered together in **one** reply once
-  the character is free again, instead of one delayed reply per message.
-  The deferred delivery piggybacks on the heartbeat (below), so it shows
-  up automatically via the existing polling — no extra client-side wiring.
+  the character is free again, instead of one delayed reply per message —
+  and that reply can use per-message reply-threading (`reply_to_id`) to
+  point at a specific earlier message when there were several distinct
+  unanswered things, the way the spec describes (§8). The deferred
+  delivery piggybacks on the heartbeat (below), so it shows up
+  automatically via the existing polling — no extra client-side wiring.
 - Chat UI: bubbles, grouping, date separators, typing indicator sized to
-  message length, read receipts, reply-to-message (double-click a bubble,
-  or long-press), emoji reactions in both directions (long-press a bubble)
+  message length, read receipts, reply-to-message and emoji reactions
+  both via one long-press action menu on any bubble (works the same on
+  touch and mouse)
 - The AI replies with **structured output** (message bubbles, an optional
   reaction, an optional new memory, an optional calendar action) rather
   than free text — the app owns delivery timing/mechanics and calendar
@@ -52,10 +58,15 @@ layered on without re-architecting anything.
 - A **scheduled function** (`heartbeat.mjs`, every 15 min) that does two
   jobs: delivers batched replies for conversations with pending messages
   once the character is free, and — for conversations with nothing
-  pending — occasionally lets the character message first, unprompted
-  (skipped entirely while busy). Either way it can also quietly touch the
-  calendar (e.g. tentatively planning something) even without sending a
-  message.
+  pending — checks whether a calendar event actually transitioned
+  (started or ended) since the last check, and only then asks the model
+  whether it's worth a spontaneous text (skipped entirely while busy, and
+  a zero-cost no-op with no AI call at all if nothing transitioned). This
+  keeps spontaneous messages tied to something real happening — "my shift
+  just ended" — rather than firing on a timer regardless of state. Either
+  way it can also quietly touch the calendar (e.g. tentatively planning
+  something) even without sending a message. The prompt also explicitly
+  discourages reflexively ending every message with a question.
 - Lightweight polling (every 7s while the tab is visible) so a spontaneous
   or deferred message shows up without a websocket/Blobs realtime setup;
   the header status line also refreshes every 60s so "current activity"
@@ -70,9 +81,9 @@ spec for the full design):
   get even a short acknowledgment, full replies always wait
 - No tentative-vs-confirmed distinction for AI-made plans (spec §6) —
   `calendar_action: create` always makes a concrete, confirmed event
-- No per-character timezone modeling — all calendar arithmetic uses a
-  single implicit clock (effectively UTC); fine for a demo, not for a
-  real multi-timezone deployment
+- Timezone is a single value for the whole character (`CHARACTER_TIMEZONE`),
+  not per-user — fine for one character with one life, not for "the user
+  is in Tokyo and the character is in Chicago" scenarios
 - Memory decay/forgetting curve and semantic retrieval — memories are a
   flat recency-ordered list, capped at 8 in context (§9, §11)
 - No `search_calendar`/`search_memory`/`search_messages` tool-calling loop
@@ -152,6 +163,7 @@ var) at its `slug`.
 | `GEMINI_MODEL`           | no       | `gemini-3.1-flash-lite`    |
 | `GEMINI_THINKING_LEVEL`  | no       | `low`                      |
 | `CHARACTER_SLUG`         | no       | `sam`                      |
+| `CHARACTER_TIMEZONE`     | no       | `America/Chicago`          |
 
 Identity's session cookies are wired up automatically by the platform once
 Identity is enabled — nothing to configure for that.

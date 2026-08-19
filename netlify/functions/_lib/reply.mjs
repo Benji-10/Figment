@@ -11,7 +11,9 @@ import {
   getUpcomingEvents,
   describeCurrentActivity,
   formatCalendarForPrompt,
+  formatNowLabel,
   applyCalendarAction,
+  getRecentTransitions,
 } from "./calendar.mjs";
 import { generateStructured } from "./gemini.mjs";
 import {
@@ -25,10 +27,6 @@ import {
   conflictResolutionSchema,
   renderTranscript,
 } from "./persona.mjs";
-
-function nowLabel() {
-  return new Date().toLocaleString("en-US", { dateStyle: "full", timeStyle: "short" });
-}
 
 function safeFollowUp(text) {
   if (typeof text !== "string") return null;
@@ -81,13 +79,30 @@ async function resolveCalendarAction({ character, action, label }) {
   return { result, followUpMessage: safeFollowUp(decision.follow_up_message) };
 }
 
-async function insertCharacterMessage(database, conversationId, text, origin) {
+async function insertCharacterMessage(database, conversationId, text, origin, replyToId = null) {
   const [row] = await database.sql`
-    INSERT INTO messages (conversation_id, sender, content, origin)
-    VALUES (${conversationId}, 'character', ${text}, ${origin})
+    INSERT INTO messages (conversation_id, sender, content, origin, reply_to_message_id)
+    VALUES (${conversationId}, 'character', ${text}, ${origin}, ${replyToId})
     RETURNING *
   `;
   return row;
+}
+
+// Validates that a model-supplied reply_to_id actually refers to a real
+// message in this conversation before we trust it — never take the
+// model's word for a foreign key.
+async function resolveReplyTarget(database, conversationId, rawId) {
+  const id = Number(rawId);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  const rows = await database.sql`
+    SELECT id FROM messages WHERE id = ${id} AND conversation_id = ${conversationId} LIMIT 1
+  `;
+  return rows.length > 0 ? rows[0].id : null;
+}
+
+function describeTransition(ev) {
+  const verb = ev.status === "active" ? "just started" : "just ended";
+  return `"${ev.title}" ${verb}${ev.details ? ` (${ev.details})` : ""}`;
 }
 
 // The full reply pipeline: covers every unread message in the
@@ -105,7 +120,7 @@ export async function deliverChatReply({ character, conversation }) {
     getRecentMemories(conversation.id),
   ]);
 
-  const label = nowLabel();
+  const label = formatNowLabel();
   const calendarText = formatCalendarForPrompt({ activeEvent, upcoming });
   const effectiveCharacter = {
     ...character,
@@ -127,12 +142,15 @@ export async function deliverChatReply({ character, conversation }) {
   });
 
   const outgoingMessages = Array.isArray(aiResult.messages)
-    ? aiResult.messages.filter((m) => typeof m === "string" && m.trim().length > 0)
+    ? aiResult.messages.filter((m) => m && typeof m.text === "string" && m.text.trim().length > 0)
     : [];
 
   const characterMessageRows = [];
-  for (const text of outgoingMessages) {
-    characterMessageRows.push(await insertCharacterMessage(database, conversation.id, text.trim(), "chat"));
+  for (const msg of outgoingMessages) {
+    const replyToId = await resolveReplyTarget(database, conversation.id, msg.reply_to_id);
+    characterMessageRows.push(
+      await insertCharacterMessage(database, conversation.id, msg.text.trim(), "chat", replyToId)
+    );
   }
 
   let reaction = null;
@@ -179,9 +197,11 @@ export async function deliverChatReply({ character, conversation }) {
   return { characterMessageRows, reaction };
 }
 
-// The heartbeat's "nothing pending" path: decide whether to spontaneously
-// text, and/or quietly touch the calendar, without any user message to
-// respond to. Skips entirely if the character is currently busy.
+// The heartbeat's "nothing pending" path. Only actually asks the model
+// anything if a calendar event transitioned (started/ended) since the
+// last check — otherwise it's a deterministic, free no-op. This keeps
+// spontaneous messages tied to something real happening rather than
+// firing on a timer regardless of state.
 export async function deliverSpontaneousCheck({ character, conversation }) {
   await syncCalendar(character.id);
   const activeEvent = await getActiveEvent(character.id);
@@ -190,6 +210,13 @@ export async function deliverSpontaneousCheck({ character, conversation }) {
     return { messaged: false, reason: "busy" };
   }
 
+  const since = conversation.last_heartbeat_at || new Date(Date.now() - 60 * 60 * 1000);
+  const transitions = await getRecentTransitions(character.id, since);
+  if (transitions.length === 0) {
+    return { messaged: false, reason: "no_trigger" };
+  }
+  const trigger = transitions.slice(0, 2).map(describeTransition).join("; ");
+
   const database = db();
   const [upcoming, history, memories] = await Promise.all([
     getUpcomingEvents(character.id),
@@ -197,7 +224,7 @@ export async function deliverSpontaneousCheck({ character, conversation }) {
     getRecentMemories(conversation.id),
   ]);
 
-  const label = nowLabel();
+  const label = formatNowLabel();
   const calendarText = formatCalendarForPrompt({ activeEvent, upcoming });
   const effectiveCharacter = {
     ...character,
@@ -209,6 +236,7 @@ export async function deliverSpontaneousCheck({ character, conversation }) {
     memories,
     now: label,
     calendarText,
+    trigger,
   });
   const input = renderTranscript(history, character.name);
 
@@ -275,7 +303,7 @@ export async function deliverAckIfWarranted({ character, conversation, activeEve
   `;
   if (pending.length === 0) return null;
 
-  const systemInstruction = buildAckSystemInstruction({ character, activeEvent, now: nowLabel() });
+  const systemInstruction = buildAckSystemInstruction({ character, activeEvent, now: formatNowLabel() });
   const input = pending.map((m) => `Friend: ${m.content}`).join("\n");
 
   const aiResult = await generateStructured({
