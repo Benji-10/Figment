@@ -2,8 +2,17 @@
 // the app owns event status transitions, conflict detection, and time
 // arithmetic; the model only ever proposes an *action* (create/move/
 // cancel/extend) through structured output, which this module validates
-// and applies. See persona.mjs for the schema the model fills in, and
+// and applies. See persona.mjs for the schemas the model fills in, and
 // reply.mjs for how a detected conflict gets resolved.
+//
+// Two distinct AI roles write to this calendar:
+//   - The chat AI (persona.mjs's chat/heartbeat schemas) can create/move/
+//     cancel/extend events as a byproduct of conversation.
+//   - The life-planner AI (plan-life.mjs, a separate scheduled function)
+//     fills genuinely open gaps in the schedule with plausible activities
+//     — it's the only source of day-to-day "what are they up to" filler;
+//     this module never invents activities itself, and only recurring
+//     commitments are hand-seeded (see schema.mjs).
 
 import { db } from "./db.mjs";
 
@@ -138,13 +147,33 @@ const toPositiveInt = (v) => {
   const n = Number(v);
   return Number.isInteger(n) && n > 0 ? n : null;
 };
+// 0-100, how reachable-by-text the character realistically is during an
+// event. Replaces a plain busy/free boolean — mechanically, it's just the
+// odds a given incoming message gets an immediate full reply (see
+// rollEngagement) rather than a deferred/ack-only response.
+function normalizeAvailability(v, fallback = 100) {
+  const n = Number(v);
+  if (!Number.isInteger(n)) return fallback;
+  return Math.max(0, Math.min(100, n));
+}
+
+// A single weighted coin flip: should the character fully engage right
+// now, given the current event's availability score? 100 = always,
+// 0 = never, everything else is genuinely probabilistic — the same
+// event won't produce identical behavior every time, which is the point.
+export function rollEngagement(availability) {
+  const score = normalizeAvailability(availability, 100);
+  return Math.random() * 100 < score;
+}
 
 /* ===================== Materialization + status refresh ===================== */
 
 // Generates concrete calendar_events from active recurring_events
 // templates for the next MATERIALIZE_WINDOW_DAYS days (idempotent), then
 // flips scheduled → active → completed based on the current time. Cheap
-// to call on every request that needs an accurate "current activity".
+// to call on every request that needs an accurate "current activity" —
+// batched into one INSERT regardless of how many templates/days there
+// are, rather than one round-trip per (template, day) pair.
 export async function syncCalendar(characterId) {
   const database = db();
   const now = new Date();
@@ -154,6 +183,7 @@ export async function syncCalendar(characterId) {
     SELECT * FROM recurring_events WHERE character_id = ${characterId} AND active = true
   `;
 
+  const rowsToInsert = [];
   for (let offset = 0; offset < MATERIALIZE_WINDOW_DAYS; offset++) {
     const targetYmd = addDaysToYMD(todayYmd, offset);
     const targetDow = dayOfWeekForYMD(targetYmd);
@@ -163,17 +193,46 @@ export async function syncCalendar(characterId) {
       if (tpl.day_of_week !== targetDow) continue;
       const [sh, sm] = String(tpl.start_time_of_day).split(":").map(Number);
       const [eh, em] = String(tpl.end_time_of_day).split(":").map(Number);
-      const startTime = zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, sh, sm, CHARACTER_TIMEZONE);
-      const endTime = zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, eh, em, CHARACTER_TIMEZONE);
-
-      await database.sql`
-        INSERT INTO calendar_events
-          (character_id, title, start_time, end_time, status, location, details, source, busy, recurring_event_id, recurrence_date)
-        VALUES
-          (${characterId}, ${tpl.title}, ${startTime.toISOString()}, ${endTime.toISOString()}, 'scheduled', ${tpl.location}, ${tpl.details}, 'recurring', ${tpl.busy}, ${tpl.id}, ${recurrenceDate})
-        ON CONFLICT (recurring_event_id, recurrence_date) DO NOTHING
-      `;
+      rowsToInsert.push({
+        title: tpl.title,
+        startTime: zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, sh, sm, CHARACTER_TIMEZONE),
+        endTime: zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, eh, em, CHARACTER_TIMEZONE),
+        location: tpl.location,
+        details: tpl.details,
+        availability: normalizeAvailability(tpl.availability),
+        recurringEventId: tpl.id,
+        recurrenceDate,
+      });
     }
+  }
+
+  if (rowsToInsert.length > 0) {
+    const values = [];
+    const params = [];
+    rowsToInsert.forEach((r, i) => {
+      const b = i * 9;
+      values.push(
+        `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, 'scheduled', $${b + 5}, $${b + 6}, 'recurring', $${b + 7}, $${b + 8}, $${b + 9})`
+      );
+      params.push(
+        characterId,
+        r.title,
+        r.startTime.toISOString(),
+        r.endTime.toISOString(),
+        r.location,
+        r.details,
+        r.availability,
+        r.recurringEventId,
+        r.recurrenceDate
+      );
+    });
+    await database.sql.query(
+      `INSERT INTO calendar_events
+         (character_id, title, start_time, end_time, status, location, details, source, availability, recurring_event_id, recurrence_date)
+       VALUES ${values.join(", ")}
+       ON CONFLICT (recurring_event_id, recurrence_date) DO NOTHING`,
+      params
+    );
   }
 
   await database.sql`
@@ -225,6 +284,17 @@ export async function getUpcomingEvents(characterId, limit = UPCOMING_LIMIT) {
   return rows;
 }
 
+export async function getRecentPastEvents(characterId, limit = 3) {
+  const database = db();
+  const rows = await database.sql`
+    SELECT * FROM calendar_events
+    WHERE character_id = ${characterId} AND status = 'completed'
+    ORDER BY end_time DESC
+    LIMIT ${limit}
+  `;
+  return rows.reverse();
+}
+
 // What goes in the chat header / into "Currently doing" in the prompt.
 export function describeCurrentActivity(character, activeEvent) {
   if (!activeEvent) return character.current_activity;
@@ -271,10 +341,10 @@ async function findConflicts(characterId, startTime, endTime, excludeEventId = n
   return rows;
 }
 
-/* ===================== Applying AI-proposed actions ===================== */
+/* ===================== Applying AI-proposed actions (chat AI) ===================== */
 
-// Validates and applies a `calendar_action` object from the model's
-// structured output. Returns one of:
+// Validates and applies a `calendar_action` object from the chat/heartbeat
+// model's structured output. Returns one of:
 //   { status: "ignored" }                       — missing/invalid fields, silently skipped
 //   { status: "not_found", action }              — event_id didn't resolve to a live event
 //   { status: "conflict", action, proposed, conflictingEvents } — needs a resolution round-trip
@@ -315,6 +385,7 @@ export async function applyCalendarAction(characterId, action, opts = {}) {
     const endTime = new Date(startTime.getTime() + action.duration_minutes * 60000);
     const details = safeString(action.details) || "";
     const location = safeString(action.location);
+    const availability = normalizeAvailability(action.availability, 100);
 
     if (!overrideConflicts) {
       const conflicts = await findConflicts(characterId, startTime, endTime);
@@ -322,7 +393,7 @@ export async function applyCalendarAction(characterId, action, opts = {}) {
         return {
           status: "conflict",
           action: "create",
-          proposed: { title, startTime, endTime, details, location },
+          proposed: { title, startTime, endTime, details, location, availability },
           conflictingEvents: conflicts,
         };
       }
@@ -331,8 +402,8 @@ export async function applyCalendarAction(characterId, action, opts = {}) {
     }
 
     const [row] = await database.sql`
-      INSERT INTO calendar_events (character_id, title, start_time, end_time, status, location, details, source, busy)
-      VALUES (${characterId}, ${title}, ${startTime.toISOString()}, ${endTime.toISOString()}, 'scheduled', ${location}, ${details}, 'planned', false)
+      INSERT INTO calendar_events (character_id, title, start_time, end_time, status, location, details, source, availability)
+      VALUES (${characterId}, ${title}, ${startTime.toISOString()}, ${endTime.toISOString()}, 'scheduled', ${location}, ${details}, 'planned', ${availability})
       RETURNING *
     `;
     return { status: "applied", action: "create", event: row };
@@ -361,6 +432,7 @@ export async function applyCalendarAction(characterId, action, opts = {}) {
       ? action.duration_minutes * 60000
       : originalDurationMs;
     const endTime = new Date(startTime.getTime() + durationMs);
+    const availability = action.availability != null ? normalizeAvailability(action.availability, existing.availability) : existing.availability;
 
     if (!overrideConflicts) {
       const conflicts = await findConflicts(characterId, startTime, endTime, eventId);
@@ -374,6 +446,7 @@ export async function applyCalendarAction(characterId, action, opts = {}) {
             endTime,
             details: existing.details,
             location: existing.location,
+            availability,
             eventId,
           },
           conflictingEvents: conflicts,
@@ -385,7 +458,7 @@ export async function applyCalendarAction(characterId, action, opts = {}) {
 
     const [row] = await database.sql`
       UPDATE calendar_events
-      SET start_time = ${startTime.toISOString()}, end_time = ${endTime.toISOString()}, updated_at = now()
+      SET start_time = ${startTime.toISOString()}, end_time = ${endTime.toISOString()}, availability = ${availability}, updated_at = now()
       WHERE id = ${eventId}
       RETURNING *
     `;
@@ -423,4 +496,61 @@ export async function applyCalendarAction(characterId, action, opts = {}) {
   }
 
   return { status: "ignored" };
+}
+
+/* ===================== Life-planner AI support ===================== */
+
+// True if nothing (recurring or otherwise) covers the character's
+// schedule from now through the next `lookaheadMinutes` — i.e. there's a
+// real gap worth asking the planner about. See plan-life.mjs.
+export async function hasNearTermGap(characterId, lookaheadMinutes) {
+  const database = db();
+  const windowStr = `${lookaheadMinutes} minutes`;
+  const rows = await database.sql`
+    SELECT 1 FROM calendar_events
+    WHERE character_id = ${characterId} AND status IN ('scheduled', 'active')
+      AND start_time <= now() + ${windowStr}::interval AND end_time > now()
+    LIMIT 1
+  `;
+  return rows.length === 0;
+}
+
+// Applied by the life-planner: schedules something starting a short,
+// relative number of minutes from right now (not a wall-clock day/hour/
+// minute like applyCalendarAction — "in 20 minutes" is timezone-agnostic
+// by construction, so no zone conversion is needed here). Silently skips
+// on invalid input or an unexpected conflict rather than looping back
+// through a resolution call — this is background world-filling, not a
+// conversational commitment, so it's fine to just try again next cycle.
+export async function planActivity(characterId, { title, startInMinutes, durationMinutes, details, location, availability }) {
+  const database = db();
+  const validTitle = safeString(title, 120);
+  if (
+    !validTitle ||
+    !Number.isInteger(startInMinutes) ||
+    startInMinutes < 0 ||
+    startInMinutes > 180 ||
+    !Number.isInteger(durationMinutes) ||
+    durationMinutes < 10 ||
+    durationMinutes > 480
+  ) {
+    return { status: "ignored" };
+  }
+
+  const startTime = new Date(Date.now() + startInMinutes * 60000);
+  const endTime = new Date(startTime.getTime() + durationMinutes * 60000);
+  const avail = normalizeAvailability(availability, 100);
+  const initialStatus = startInMinutes === 0 ? "active" : "scheduled";
+
+  const conflicts = await findConflicts(characterId, startTime, endTime);
+  if (conflicts.length > 0) {
+    return { status: "conflict", conflictingEvents: conflicts };
+  }
+
+  const [row] = await database.sql`
+    INSERT INTO calendar_events (character_id, title, start_time, end_time, status, location, details, source, availability)
+    VALUES (${characterId}, ${validTitle}, ${startTime.toISOString()}, ${endTime.toISOString()}, ${initialStatus}, ${safeString(location)}, ${safeString(details) || ""}, 'generated', ${avail})
+    RETURNING *
+  `;
+  return { status: "applied", event: row };
 }

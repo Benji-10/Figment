@@ -14,6 +14,7 @@ import {
   formatNowLabel,
   applyCalendarAction,
   getRecentTransitions,
+  rollEngagement,
 } from "./calendar.mjs";
 import { generateStructured } from "./gemini.mjs";
 import {
@@ -206,8 +207,8 @@ export async function deliverSpontaneousCheck({ character, conversation }) {
   await syncCalendar(character.id);
   const activeEvent = await getActiveEvent(character.id);
 
-  if (activeEvent?.busy) {
-    return { messaged: false, reason: "busy" };
+  if (!rollEngagement(activeEvent ? activeEvent.availability : 100)) {
+    return { messaged: false, reason: "unavailable" };
   }
 
   const since = conversation.last_heartbeat_at || new Date(Date.now() - 60 * 60 * 1000);

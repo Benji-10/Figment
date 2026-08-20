@@ -1,7 +1,7 @@
 import { requireUser, jsonError, HttpError } from "./_lib/auth.mjs";
 import { db } from "./_lib/db.mjs";
 import { getCharacter, ensureConversation } from "./_lib/conversation.mjs";
-import { syncCalendar, getActiveEvent } from "./_lib/calendar.mjs";
+import { syncCalendar, getActiveEvent, rollEngagement } from "./_lib/calendar.mjs";
 import { deliverChatReply, deliverAckIfWarranted } from "./_lib/reply.mjs";
 
 const MAX_MESSAGE_LENGTH = 2000;
@@ -35,20 +35,24 @@ export default async (req, context) => {
       RETURNING *
     `;
 
-    // Response-session gating (spec §7-8): if the character is in a
-    // low-availability calendar event, don't generate the full reply now.
-    // At most send a short acknowledgment (only if this message seems
-    // urgent enough to warrant one), and leave the rest of the pending
-    // messages for the heartbeat to answer as one batched reply once the
-    // character is free again.
+    // Response-session gating (spec §7-8): each event has a 0-100
+    // "availability" score rather than a hard busy/free flag, so this is
+    // a weighted coin flip, not a wall — even during a low-availability
+    // event there's some chance of a normal, immediate reply, and during
+    // a high-availability one (most of the day, via the life-planner)
+    // it's close to guaranteed. When the roll doesn't land on "respond
+    // now", at most a short acknowledgment goes out (only if this
+    // message seems urgent enough to warrant one), and the rest of the
+    // pending messages wait for the heartbeat to answer as one batched
+    // reply.
     await syncCalendar(character.id);
     const activeEvent = await getActiveEvent(character.id);
+    const respondNow = rollEngagement(activeEvent ? activeEvent.availability : 100);
 
     let characterMessageRows = [];
     let reaction = null;
-    const busy = Boolean(activeEvent?.busy);
 
-    if (busy) {
+    if (!respondNow && activeEvent) {
       const ack = await deliverAckIfWarranted({ character, conversation, activeEvent });
       if (ack) characterMessageRows = [ack];
       await database.sql`
@@ -64,7 +68,7 @@ export default async (req, context) => {
       userMessage: serializeMessage(userMessageRow),
       characterMessages: characterMessageRows.map(serializeMessage),
       reaction,
-      busy,
+      busy: !respondNow && Boolean(activeEvent),
     });
   } catch (error) {
     return jsonError(error);

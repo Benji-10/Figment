@@ -19,7 +19,7 @@ export default async (req, context) => {
         tagline: character.tagline,
         currentActivity: describeCurrentActivity(character, activeEvent),
         currentMood: character.current_mood,
-        busy: Boolean(activeEvent?.busy),
+        busy: Boolean(activeEvent && activeEvent.availability < 50),
         statusUpdatedAt: character.status_updated_at,
       },
       conversationId: conversation.id,

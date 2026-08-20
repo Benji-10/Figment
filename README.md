@@ -8,9 +8,9 @@ for the character's responses.
 ## What's here vs. what's next
 
 This is the **basic** slice, not the full 30-section spec. It's built so the
-rest of the spec (calendar/event engine, memory decay, response-session
-grouping, multiple characters, urgency-aware interruption logic...) can be
-layered on without re-architecting anything.
+rest of the spec (memory decay, multiple characters, urgency-aware
+interruption logic beyond availability scores...) can be layered on without
+re-architecting anything.
 
 **Implemented:**
 - Netlify Identity login/signup, gating the chat behind auth
@@ -19,54 +19,87 @@ layered on without re-architecting anything.
 - A persistent character with a stable persona *and* mutable state
   (`current_mood`, plus a live `current_activity` now driven by the
   calendar — see below) — spec §2
-- **Calendar / event engine** (spec §3–4): recurring weekly events
-  (seminar, work shift, family call) materialize into concrete dated
-  events automatically, on a real IANA timezone (`CHARACTER_TIMEZONE`,
-  default `America/Chicago`) — "2pm" in the schedule means 2pm there, not
-  2pm UTC. The model can create/move/cancel/extend events through
-  structured output (`calendar_action`), validated and executed
-  deterministically by the app. Overlapping creates/moves are caught
-  before they're applied — the app detects the conflict, asks the model
-  in-character how it wants to resolve it (keep the new plan and cancel
-  the old one, or drop the new plan), and applies whichever it picks, the
-  same "clash flow" the spec walks through. `extend` handles realistic
-  drift (a shift running long) without needing AI involvement — that's
-  pure arithmetic, so the app just does it.
-- **Response-session batching** (spec §7–8): each recurring/calendar
-  event can be marked "busy." While the character is in a busy event,
-  incoming messages don't get an immediate full reply — at most one short
-  acknowledgment (only if the app's quick urgency check thinks it's worth
+- **Two separate AI roles, not one** — this is the important architectural
+  point:
+  - **The chat AI** (`persona.mjs`'s chat/heartbeat/ack builders, called
+    from `chat.mjs`/`heartbeat.mjs`) only ever talks to a specific person.
+    It has no say over what the character is *doing* — it just reacts to
+    conversation, and can *propose* a calendar action (agreeing to plans,
+    bailing on something) which the app validates before applying.
+  - **The life-planner AI** (`plan-life.mjs`, a separate scheduled
+    function, new prompt in `persona.mjs`) never talks to anyone and
+    doesn't know any specific conversation exists. It only looks at gaps
+    in the character's own calendar and decides what fills them —
+    chores, downtime, errands, seeing a friend — including setting its
+    *own* availability score for that activity. Only genuine fixed
+    commitments (class, a paid shift, a standing call) are hand-seeded in
+    `recurring_events`; everything else in a day originates from this AI,
+    not from hardcoded filler, which is what the spec's "avoid manually
+    tuned content" principle actually asks for once you take it seriously.
+- **Calendar / event engine** (spec §3–4): recurring commitments
+  materialize into concrete dated events automatically, on a real IANA
+  timezone (`CHARACTER_TIMEZONE`, default `America/Chicago`) — "2pm" in
+  the schedule means 2pm there, not 2pm UTC. Either AI can create/move/
+  cancel/extend events through the same structured `calendar_action`
+  shape, validated and executed deterministically by the app. Overlapping
+  creates/moves are caught before they're applied — the app detects the
+  conflict, asks the model in-character how it wants to resolve it (keep
+  the new plan and cancel the old one, or drop the new plan), and applies
+  whichever it picks, the same "clash flow" the spec walks through.
+  `extend` handles realistic drift (a shift running long) without needing
+  AI involvement — that's pure arithmetic, so the app just does it.
+- **Availability score, not a busy/free flag**: every event (recurring or
+  AI-generated) carries a 0–100 availability score instead of a boolean.
+  Mechanically it's a weighted coin flip (`rollEngagement`, in
+  `calendar.mjs`) that decides, per incoming message, whether the
+  character responds immediately in full or the message gets deferred —
+  so a low-availability event (an exam, a shift) is *mostly* unresponsive
+  but not absolutely silent, and a high-availability one (folding
+  laundry, watching TV) responds close to normally. This directly
+  replaces an earlier hard busy/free gate that made the character
+  unreachable for the entire length of any "busy" event — the score is
+  set by whichever AI created the event (the planner decides how
+  reachable "getting coffee with a friend" realistically is; you can also
+  hand-set it on the seeded recurring rows).
+- **Response-session batching** (spec §7–8): when the availability roll
+  doesn't land on "respond now," at most one short acknowledgment goes
+  out (only if the app's quick urgency check thinks it's worth
   interrupting for), and the actual reply is deferred. Multiple messages
   sent during that window all get answered together in **one** reply once
-  the character is free again, instead of one delayed reply per message —
-  and that reply can use per-message reply-threading (`reply_to_id`) to
-  point at a specific earlier message when there were several distinct
-  unanswered things, the way the spec describes (§8). The deferred
-  delivery piggybacks on the heartbeat (below), so it shows up
-  automatically via the existing polling — no extra client-side wiring.
+  the character is free again (or the next favorable roll), instead of
+  one delayed reply per message — and that reply can use per-message
+  reply-threading (`reply_to_id`) to point at a specific earlier message
+  when there were several distinct unanswered things, the way the spec
+  describes (§8). The deferred delivery piggybacks on the heartbeat
+  (below), so it shows up automatically via the existing polling — no
+  extra client-side wiring.
 - Chat UI: bubbles, grouping, date separators, typing indicator sized to
   message length, read receipts, reply-to-message and emoji reactions
   both via one long-press action menu on any bubble (works the same on
   touch and mouse)
-- The AI replies with **structured output** (message bubbles, an optional
-  reaction, an optional new memory, an optional calendar action) rather
-  than free text — the app owns delivery timing/mechanics and calendar
-  validation, the model owns interpretation, per the spec's central
-  architectural principle
+- The chat AI replies with **structured output** (message bubbles, an
+  optional reaction, an optional new memory, an optional calendar action)
+  rather than free text — the app owns delivery timing/mechanics and
+  calendar validation, the model owns interpretation, per the spec's
+  central architectural principle
 - A flat per-conversation memory list fed back into every prompt (spec §9,
   without the decay/forgetting-curve refinement in §11)
-- A **scheduled function** (`heartbeat.mjs`, every 15 min) that does two
-  jobs: delivers batched replies for conversations with pending messages
-  once the character is free, and — for conversations with nothing
-  pending — checks whether a calendar event actually transitioned
-  (started or ended) since the last check, and only then asks the model
-  whether it's worth a spontaneous text (skipped entirely while busy, and
-  a zero-cost no-op with no AI call at all if nothing transitioned). This
-  keeps spontaneous messages tied to something real happening — "my shift
-  just ended" — rather than firing on a timer regardless of state. Either
-  way it can also quietly touch the calendar (e.g. tentatively planning
-  something) even without sending a message. The prompt also explicitly
-  discourages reflexively ending every message with a question.
+- A **scheduled function** (`heartbeat.mjs`, every 15 min, conversation-
+  scoped) that does two jobs: delivers batched replies for conversations
+  with pending messages once the availability roll allows it, and — for
+  conversations with nothing pending — checks whether a calendar event
+  actually transitioned (started or ended) since the last check, and only
+  then asks the model whether it's worth a spontaneous text (a zero-cost
+  no-op with no AI call at all if nothing transitioned, and gated by the
+  same availability roll). This keeps spontaneous messages tied to
+  something real happening — "my shift just ended" — rather than firing
+  on a timer regardless of state. The prompt also explicitly discourages
+  reflexively ending every message with a question.
+- A **second scheduled function** (`plan-life.mjs`, every 20 min,
+  character-scoped, not conversation-scoped) — the life-planner described
+  above. Only runs the AI call when there's an actual gap in the near-term
+  schedule (nothing covering the next 90 minutes); paced by
+  `characters.last_planned_at` so it doesn't replan on every tick.
 - Lightweight polling (every 7s while the tab is visible) so a spontaneous
   or deferred message shows up without a websocket/Blobs realtime setup;
   the header status line also refreshes every 60s so "current activity"
@@ -74,11 +107,6 @@ layered on without re-architecting anything.
 
 **Deliberately left out / stubbed for later phases** (see the original
 spec for the full design):
-- Conversation response sessions batch by *busy status*, not by a
-  message-priority/urgency model that can interrupt anything — the spec's
-  fuller picture (§7) has urgency potentially overriding almost any
-  activity; here "busy" is a fixed per-event flag and only urgent messages
-  get even a short acknowledgment, full replies always wait
 - No tentative-vs-confirmed distinction for AI-made plans (spec §6) —
   `calendar_action: create` always makes a concrete, confirmed event
 - Timezone is a single value for the whole character (`CHARACTER_TIMEZONE`),
@@ -90,6 +118,9 @@ spec for the full design):
   — the model gets a compact snapshot of upcoming events and recent
   memories up front rather than being able to query for more on demand
 - Multiple characters (schema supports it; the app only looks up one slug)
+- The life-planner only fills the *immediate* gap (next ~90 minutes), not
+  further-out plans like "next Saturday" — far-future spontaneous planning
+  is still only something the chat AI does mid-conversation (spec §6)
 
 ## A note on the model name
 
@@ -138,18 +169,23 @@ context, so this works without HTTPS locally).
 
 ## Editing the character / calendar
 
-The character's persona and weekly rhythm live in the `characters` and
-`recurring_events` tables, seeded automatically the first time the app runs
-(see `netlify/functions/_lib/schema.mjs` — `db/schema.sql` has the same DDL
-if you'd rather run it by hand in Neon's SQL editor first). Easiest way to
-tweak either: open Neon's SQL editor (or any Postgres client):
+The character's persona and fixed weekly commitments live in the
+`characters` and `recurring_events` tables, seeded automatically the first
+time the app runs (see `netlify/functions/_lib/schema.mjs` — `db/schema.sql`
+has the same DDL if you'd rather run it by hand in Neon's SQL editor
+first). Easiest way to tweak either: open Neon's SQL editor (or any
+Postgres client):
 - Edit the `sam` row in `characters` for persona/mood/tagline.
-- Edit rows in `recurring_events` for the weekly schedule — `busy = true`
-  means messages during that event get deferred and batched (response
-  sessions); `busy = false` means the character replies normally even
-  during it (like the seeded Sunday family call).
-- One-off plans the AI makes show up in `calendar_events` with
-  `source = 'planned'`; recurring-derived ones have `source = 'recurring'`.
+- Edit rows in `recurring_events` for genuinely fixed commitments —
+  `availability` (0-100) controls how likely an immediate reply is during
+  that event; low values (seminar/shift are seeded at 8/20) mean mostly-
+  deferred, high values mean close to normal. Everything else in the
+  day — chores, downtime, seeing friends — is generated by the
+  life-planner AI on its own; you don't need to seed it.
+- Events show up in `calendar_events` tagged by `source`: `recurring`
+  (materialized from a template), `generated` (the life-planner filling a
+  gap), or `planned` (the chat AI making/agreeing to something
+  mid-conversation).
 
 To add a second character, insert a new row and point `CHARACTER_SLUG` (env
 var) at its `slug`.
@@ -170,17 +206,18 @@ Identity is enabled — nothing to configure for that.
 
 ## Cost/scale notes
 
-The heartbeat function checks at most 5 recently-active conversations every
-15 minutes, and skips any conversation it already checked in the last 25
-minutes — so it stays cheap even as users grow, at the cost of spontaneous
-and deferred-batch messages sometimes landing later than the spec's ideal
-3-minute cadence (worst case for a batched reply: up to ~25 minutes after a
-busy event ends). If you deploy this for real usage, that batch size/interval
-in `heartbeat.mjs` is the first knob to revisit, and a cheap pre-filter
-before calling Gemini (e.g. only call the model if a conversation is "due"
-by some heuristic) would cut costs further at higher scale. A calendar
-conflict adds one extra Gemini call (only when a conflict actually occurs),
-so it's rare in practice.
+Two scheduled functions run independently: `heartbeat.mjs` (every 15 min,
+checks up to 5 recently-active conversations, skips any it already checked
+in the last 25 min) and `plan-life.mjs` (every 20 min, checks up to 10
+characters, skips any it already planned for in the last 20 min and does
+nothing at all — no AI call — if there's no actual gap in the schedule).
+Both stay cheap as usage grows, at the cost of things sometimes landing
+later than the spec's ideal cadence (worst case for a batched reply: up to
+~25 minutes after availability improves; worst case for the world feeling
+"unpopulated": up to ~20 minutes into a new gap). If you deploy this for
+real usage, those batch sizes/intervals are the first knobs to revisit. A
+calendar conflict adds one extra Gemini call (only when a conflict actually
+occurs), so it's rare in practice.
 
 ## File map
 
@@ -190,15 +227,16 @@ netlify/functions/_lib/db.mjs               Neon connection + self-applying sche
 netlify/functions/_lib/schema.mjs           table DDL + seed character/recurring events
 netlify/functions/_lib/auth.mjs             Identity verification
 netlify/functions/_lib/conversation.mjs     character/conversation/message lookups
-netlify/functions/_lib/calendar.mjs         calendar engine: materialize, conflicts, actions
+netlify/functions/_lib/calendar.mjs         calendar engine: materialize, conflicts, actions, availability rolls
 netlify/functions/_lib/gemini.mjs           Gemini Interactions API client
-netlify/functions/_lib/persona.mjs          system prompts + response JSON schemas
-netlify/functions/_lib/reply.mjs            shared reply/ack/spontaneous delivery logic
+netlify/functions/_lib/persona.mjs          system prompts + response JSON schemas (both AI roles)
+netlify/functions/_lib/reply.mjs            shared reply/ack/spontaneous delivery logic (chat AI)
 netlify/functions/me.mjs                    GET  /api/me       bootstrap + live status
 netlify/functions/messages.mjs              GET  /api/messages history/polling
-netlify/functions/chat.mjs                  POST /api/chat     send a message (busy-gated)
+netlify/functions/chat.mjs                  POST /api/chat     send a message (availability-gated)
 netlify/functions/react.mjs                 POST /api/react    toggle a reaction
-netlify/functions/heartbeat.mjs             scheduled          batched replies + spontaneous messages
+netlify/functions/heartbeat.mjs             scheduled          batched replies + spontaneous messages (chat AI)
+netlify/functions/plan-life.mjs             scheduled          fills calendar gaps (life-planner AI)
 src/app.js                                  client logic (bundled to public/)
 public/index.html, public/styles.css        chat UI
 ```

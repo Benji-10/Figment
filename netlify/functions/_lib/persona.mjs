@@ -17,6 +17,7 @@ const CALENDAR_ACTION_INSTRUCTIONS = `
   - action "move": needs event_id (the [id N] of an existing event above), day_offset, start_hour, start_minute. duration_minutes is optional (keeps the original length if omitted).
   - action "cancel": needs event_id.
   - action "extend": needs event_id and duration_minutes (minutes to add — use a negative number to cut it short instead). Use this for realistic drift, like a bus running late.
+  - "availability" (0-100, optional): for create/move, how reachable-by-text you'd realistically be during it — high for something casual, low for something absorbing or that'd be rude to text through. Leave null to default to fully available.
   - Leave every field you're not using as null. Only ever propose ONE calendar_action per response.`;
 
 const CALENDAR_ACTION_PROPERTY = {
@@ -46,6 +47,11 @@ const CALENDAR_ACTION_PROPERTY = {
     },
     details: { type: ["string", "null"] },
     location: { type: ["string", "null"] },
+    availability: {
+      type: ["integer", "null"],
+      description:
+        "0-100, how reachable-by-text you'd be during this (create/move only). Null defaults to fully available (100).",
+    },
   },
   required: [
     "action",
@@ -57,6 +63,7 @@ const CALENDAR_ACTION_PROPERTY = {
     "duration_minutes",
     "details",
     "location",
+    "availability",
   ],
 };
 
@@ -274,6 +281,70 @@ export const conflictResolutionSchema = {
     },
   },
   required: ["resolution", "follow_up_message"],
+};
+
+// ===================== Life planner (a separate AI role — see plan-life.mjs) =====================
+//
+// This AI never talks to anyone. It only decides what the character is
+// doing with open time on their calendar — the "AI underneath" that
+// determines what happens to the chat-facing character, so day-to-day
+// texture (chores, downtime, hanging out) comes from genuine AI
+// judgment rather than a hardcoded schedule. Only fixed recurring
+// commitments are hand-seeded; everything else originates here.
+
+export function buildLifePlanSystemInstruction({ character, now, recentPast, upcoming }) {
+  const eventLine = (ev) =>
+    `- ${formatEventTimeRange(ev, new Date())} — ${ev.title}${ev.details ? ` (${ev.details})` : ""}`;
+  const pastLines = recentPast.length ? recentPast.map(eventLine).join("\n") : "- (nothing recent)";
+  const upcomingLines = upcoming.length ? upcoming.map(eventLine).join("\n") : "- (nothing else scheduled yet)";
+
+  return `You are quietly deciding what ${character.name} does next — not writing a message to anyone, just figuring out the next stretch of their day, the way a person's schedule naturally fills in around fixed commitments.
+
+WHO THEY ARE
+${character.persona}
+
+RIGHT NOW
+Current date/time: ${now}
+
+RECENTLY
+${pastLines}
+
+ALREADY COMING UP (don't schedule anything that overlaps these)
+${upcomingLines}
+
+HOW TO DECIDE
+- There's a gap in their schedule starting right around now. Given who they are, the day of week, the time of day, and what's recently happened or is already coming up, what would they realistically be doing?
+- "should_plan" should often be false — plenty of time is genuinely unstructured (scrolling their phone, doing nothing in particular) and doesn't need a named activity. Don't force something onto every gap.
+- When you do plan something, keep it mundane and true to life: chores, food, errands, a hobby, downtime, seeing a friend, transit, running an errand — not everything needs to be exciting or notable. Most of life is unremarkable, and that's fine.
+- Avoid repeating the same activity you just did (see RECENTLY) unless it genuinely makes sense to.
+- "start_in_minutes": 0 if it's starting right now, or a bit more (up to 90) if it's something they'd head out for shortly.
+- "duration_minutes": how long it realistically lasts (10 to 480).
+- "availability": your honest estimate of how reachable/responsive they'd be by text during it — high (80-100) for solo downtime at home, low (0-20) for something absorbing or social where checking the phone would be rude or impractical, and anything in between. Use your judgment, not a fixed rule.
+- Keep "title" short (a few words) and "details" to one brief clause.
+${SAFETY_RULES}`;
+}
+
+export const lifePlanResponseSchema = {
+  type: "object",
+  properties: {
+    should_plan: {
+      type: "boolean",
+      description: "Whether to schedule a specific activity for this open block of time, or leave it unstructured.",
+    },
+    activity: {
+      type: ["object", "null"],
+      properties: {
+        title: { type: ["string", "null"] },
+        start_in_minutes: { type: ["integer", "null"], description: "0-90 minutes from right now." },
+        duration_minutes: { type: ["integer", "null"], description: "10-480." },
+        details: { type: ["string", "null"] },
+        location: { type: ["string", "null"] },
+        availability: { type: ["integer", "null"], description: "0-100." },
+      },
+      required: ["title", "start_in_minutes", "duration_minutes", "details", "location", "availability"],
+    },
+  },
+  required: ["should_plan", "activity"],
 };
 
 // Renders recent messages as a plain-text transcript for the model,
