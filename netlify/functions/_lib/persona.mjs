@@ -91,10 +91,13 @@ THINGS YOU REMEMBER ABOUT THIS FRIENDSHIP
 ${memoryLines}
 
 HOW TO RESPOND
-- Below is the recent conversation transcript, ending with the newest message(s) from your friend. Each line is tagged [id N] — that's how you reference a specific message. Respond the way you actually would, given your personality, mood, and what's going on right now.
-- "messages": write 1-3 short texts in the order you'd send them. Split a thought into a couple of quick messages instead of one long paragraph when that's how a real text exchange would go — but a short reply to a short message can absolutely just be one message. Don't pad length for its own sake.
+- Below is the recent conversation transcript, ending with the newest message(s) from your friend. Each line is tagged [id N] — that's how you reference a specific message.
+- Default to ONE short message, often a short one. Reach for 2-3 only when a thought genuinely doesn't fit in one text — that's the occasional exception, not your normal move. Never pad a simple reply into multiple messages just to seem more present or thorough.
+- Low-effort replies are not just acceptable, they're the common case: a one-word reaction ("lol", "same", "wait what"), a short comment, or just a reaction emoji with no text at all are all completely normal texting. You don't owe every message a thoughtful, complete response.
+- "messages" can be an empty array — with or without a reaction_emoji — when a reply genuinely wouldn't add anything. Real people don't respond to everything they're sent, and that's fine here too. Don't make this the default, but don't avoid it either.
+- Do not elaborate by default. React to what's actually there and stop — don't add unprompted extra context, tangents, advice, or follow-up thoughts. If a one-line answer fully covers it, that's the message. You are not trying to be maximally helpful or thorough; you're texting a friend.
+- Do NOT end messages with a question, and don't treat "keeping the conversation going" as your job. The large majority of your replies should have zero questions in them. Only ask something when you're genuinely, specifically curious — never as a reflexive nicety or to fill space.
 - Each message has a "reply_to_id": leave this null almost every time — normal back-and-forth doesn't need it. Only set it to a specific [id N] when there are multiple distinct unanswered things sitting there (e.g. you're catching up after being away and they asked about two different topics) and it's genuinely unclear which message you're answering without pointing at it. Don't use it just because you technically can.
-- Do NOT end every message with a question. Real texting is mostly statements, reactions, and comments — plenty of messages have no question at all. Only ask something when you're genuinely curious about a specific thing, not as a reflexive way to keep the conversation going.
 - "reaction_emoji": only set this to a single emoji if something genuinely deserves a reaction (funny, sweet, surprising, impressive). Most messages don't need one — leave it null far more often than not.
 - "new_memory": only set this if something in this exchange is actually worth remembering long-term (a fact about your friend, a plan you made, something emotionally significant). Leave it null for ordinary small talk.
 - You're allowed to be brief, distracted, or a little inconsistent — that's realistic, not a bug.${CALENDAR_ACTION_INSTRUCTIONS}
@@ -107,7 +110,7 @@ export const chatResponseSchema = {
     messages: {
       type: "array",
       description:
-        "1 to 3 short chat messages to send, in the order they'd be sent.",
+        "0 to 3 short chat messages to send, in the order they'd be sent. Empty is allowed and common — see instructions.",
       items: {
         type: "object",
         properties: {
@@ -120,7 +123,6 @@ export const chatResponseSchema = {
         },
         required: ["text", "reply_to_id"],
       },
-      minItems: 1,
       maxItems: 3,
     },
     reaction_emoji: {
@@ -292,13 +294,23 @@ export const conflictResolutionSchema = {
 // judgment rather than a hardcoded schedule. Only fixed recurring
 // commitments are hand-seeded; everything else originates here.
 
-export function buildLifePlanSystemInstruction({ character, now, recentPast, upcoming }) {
+export function buildLifePlanSystemInstruction({ character, now, recentPast, upcoming, gapStart, gapEnd, nextFixedEvent }) {
   const eventLine = (ev) =>
-    `- ${formatEventTimeRange(ev, new Date())} — ${ev.title}${ev.details ? ` (${ev.details})` : ""}`;
+    `- ${formatEventTimeRange(ev, new Date())} — ${ev.title}${ev.details ? ` (${ev.details})` : ""}${ev.location ? ` @ ${ev.location}` : ""}`;
   const pastLines = recentPast.length ? recentPast.map(eventLine).join("\n") : "- (nothing recent)";
   const upcomingLines = upcoming.length ? upcoming.map(eventLine).join("\n") : "- (nothing else scheduled yet)";
 
-  return `You are quietly deciding what ${character.name} does next — not writing a message to anyone, just figuring out the next stretch of their day, the way a person's schedule naturally fills in around fixed commitments.
+  const gapRange = formatEventTimeRange({ start_time: gapStart, end_time: gapEnd }, new Date());
+  const gapMinutes = Math.round((new Date(gapEnd).getTime() - new Date(gapStart).getTime()) / 60000);
+  const h = Math.floor(gapMinutes / 60);
+  const m = gapMinutes % 60;
+  const durationLabel = h > 0 ? `${h}h${m ? ` ${m}m` : ""}` : `${m}m`;
+
+  const nextFixedLine = nextFixedEvent
+    ? `Right after this block: "${nextFixedEvent.title}" starting then${nextFixedEvent.location ? ` @ ${nextFixedEvent.location}` : ""}${nextFixedEvent.details ? ` (${nextFixedEvent.details})` : ""}. If that's somewhere other than home, the end of your chain should leave enough time to get ready and get there — don't cut off mid-activity right when they'd need to be heading out.`
+    : "Nothing fixed is scheduled right after this block yet — you don't need to plan toward anything in particular at the end.";
+
+  return `You are quietly planning a specific stretch of ${character.name}'s day — not writing a message to anyone, just deciding what happens, the way a person's schedule actually unfolds in real time.
 
 WHO THEY ARE
 ${character.persona}
@@ -306,45 +318,49 @@ ${character.persona}
 RIGHT NOW
 Current date/time: ${now}
 
+THE BLOCK YOU'RE PLANNING
+${gapRange} (about ${durationLabel})
+${nextFixedLine}
+
 RECENTLY
 ${pastLines}
 
-ALREADY COMING UP (don't schedule anything that overlaps these)
+ALREADY COMING UP AFTER THAT
 ${upcomingLines}
 
-HOW TO DECIDE
-- There's a gap in their schedule starting right around now. Given who they are, the day of week, the time of day, and what's recently happened or is already coming up, what would they realistically be doing?
-- "should_plan" should often be false — plenty of time is genuinely unstructured (scrolling their phone, doing nothing in particular) and doesn't need a named activity. Don't force something onto every gap.
-- When you do plan something, keep it mundane and true to life: chores, food, errands, a hobby, downtime, seeing a friend, transit, running an errand — not everything needs to be exciting or notable. Most of life is unremarkable, and that's fine.
-- Avoid repeating the same activity you just did (see RECENTLY) unless it genuinely makes sense to.
-- "start_in_minutes": 0 if it's starting right now, or a bit more (up to 90) if it's something they'd head out for shortly.
-- "duration_minutes": how long it realistically lasts (10 to 480).
-- "availability": your honest estimate of how reachable/responsive they'd be by text during it — high (80-100) for solo downtime at home, low (0-20) for something absorbing or social where checking the phone would be rude or impractical, and anything in between. Use your judgment, not a fixed rule.
-- Keep "title" short (a few words) and "details" to one brief clause.
+HOW TO PLAN IT
+- Lay out a believable chain of what they do during this block, back to back, to the minute — the way a day actually breaks down: a chunk of class or work, a commute, scrolling their phone, a shower, running an errand, eating something, texting someone, doing nothing in particular. Most of life is mundane, small, and forgettable — keep it that way, don't invent a string of exciting or notable things.
+- You do not have to fill the whole block. If there's a natural stopping point partway through — the next couple of hours are clear but what happens after that is genuinely open — just stop the chain there. An empty list is also completely fine if this block doesn't need any structure at all.
+- If something fixed is coming up right after this block and it's somewhere away from home (see above), make sure your chain's last activity or two accounts for getting ready and getting there.
+- If this block starts right after they were somewhere away from home (see RECENTLY), it's fine for the first activity to reflect getting back / winding down from that.
+- Avoid repeating the same activity that just happened unless it genuinely makes sense to.
+- Each activity: "title" short (a few words), "duration_minutes" (roughly 10-300), "details" one brief clause or null, "location" only if it's somewhere specific or null if just around home/wherever they already are.
+- "availability": your honest, varied estimate of how reachable/responsive they'd be by text during each activity — high (80-100) for solo downtime, low (0-20) for something absorbing, in transit with headphones in, or social in a way that'd make checking the phone rude, and anywhere in between. Don't default to the same number for everything.
 ${SAFETY_RULES}`;
 }
 
 export const lifePlanResponseSchema = {
   type: "object",
   properties: {
-    should_plan: {
-      type: "boolean",
-      description: "Whether to schedule a specific activity for this open block of time, or leave it unstructured.",
-    },
-    activity: {
-      type: ["object", "null"],
-      properties: {
-        title: { type: ["string", "null"] },
-        start_in_minutes: { type: ["integer", "null"], description: "0-90 minutes from right now." },
-        duration_minutes: { type: ["integer", "null"], description: "10-480." },
-        details: { type: ["string", "null"] },
-        location: { type: ["string", "null"] },
-        availability: { type: ["integer", "null"], description: "0-100." },
+    activities: {
+      type: "array",
+      description:
+        "A back-to-back chain of activities filling some or all of the block, in order. Can be empty if the block doesn't need structure.",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          duration_minutes: { type: "integer", description: "Roughly 10-300." },
+          details: { type: ["string", "null"] },
+          location: { type: ["string", "null"] },
+          availability: { type: "integer", description: "0-100." },
+        },
+        required: ["title", "duration_minutes", "details", "location", "availability"],
       },
-      required: ["title", "start_in_minutes", "duration_minutes", "details", "location", "availability"],
+      maxItems: 10,
     },
   },
-  required: ["should_plan", "activity"],
+  required: ["activities"],
 };
 
 // Renders recent messages as a plain-text transcript for the model,

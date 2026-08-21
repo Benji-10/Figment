@@ -500,57 +500,111 @@ export async function applyCalendarAction(characterId, action, opts = {}) {
 
 /* ===================== Life-planner AI support ===================== */
 
-// True if nothing (recurring or otherwise) covers the character's
-// schedule from now through the next `lookaheadMinutes` — i.e. there's a
-// real gap worth asking the planner about. See plan-life.mjs.
-export async function hasNearTermGap(characterId, lookaheadMinutes) {
+const PLANNING_HORIZON_DAYS = 3; // how far ahead the planner tries to keep the schedule filled
+const MIN_GAP_MINUTES = 10; // gaps smaller than this aren't worth a filler activity
+const MAX_BLOCK_MINUTES = 360; // don't ask the planner to fill more than ~6h in one call
+
+// Walks the character's timeline forward from now, looking for the first
+// real open stretch — properly, not just "is right now covered" (an
+// earlier version only checked the next ~90 minutes, which meant it could
+// never see or plan further ahead). Returns null once the schedule is
+// already filled all the way to the planning horizon.
+export async function findNextGap(characterId, opts = {}) {
+  const horizonDays = opts.horizonDays ?? PLANNING_HORIZON_DAYS;
+  const minGapMinutes = opts.minGapMinutes ?? MIN_GAP_MINUTES;
+  const maxBlockMinutes = opts.maxBlockMinutes ?? MAX_BLOCK_MINUTES;
+
   const database = db();
-  const windowStr = `${lookaheadMinutes} minutes`;
-  const rows = await database.sql`
-    SELECT 1 FROM calendar_events
+  const horizonEnd = new Date(Date.now() + horizonDays * 86400000);
+
+  const events = await database.sql`
+    SELECT * FROM calendar_events
     WHERE character_id = ${characterId} AND status IN ('scheduled', 'active')
-      AND start_time <= now() + ${windowStr}::interval AND end_time > now()
-    LIMIT 1
+      AND end_time > now() AND start_time < ${horizonEnd.toISOString()}
+    ORDER BY start_time
   `;
-  return rows.length === 0;
+
+  let cursor = new Date();
+  for (const ev of events) {
+    const start = new Date(ev.start_time);
+    const end = new Date(ev.end_time);
+    const gapMinutes = (start.getTime() - cursor.getTime()) / 60000;
+    if (gapMinutes >= minGapMinutes) {
+      const cappedEnd = new Date(Math.min(start.getTime(), cursor.getTime() + maxBlockMinutes * 60000));
+      return { start: cursor, end: cappedEnd, nextFixedEvent: ev };
+    }
+    if (end.getTime() > cursor.getTime()) cursor = end;
+  }
+
+  if (cursor.getTime() < horizonEnd.getTime()) {
+    const remainingMinutes = (horizonEnd.getTime() - cursor.getTime()) / 60000;
+    if (remainingMinutes < minGapMinutes) {
+      return null; // a sliver this small at the horizon's edge isn't worth planning
+    }
+    const cappedEnd = new Date(Math.min(horizonEnd.getTime(), cursor.getTime() + maxBlockMinutes * 60000));
+    return { start: cursor, end: cappedEnd, nextFixedEvent: null };
+  }
+
+  return null; // already planned all the way through the horizon
 }
 
-// Applied by the life-planner: schedules something starting a short,
-// relative number of minutes from right now (not a wall-clock day/hour/
-// minute like applyCalendarAction — "in 20 minutes" is timezone-agnostic
-// by construction, so no zone conversion is needed here). Silently skips
-// on invalid input or an unexpected conflict rather than looping back
-// through a resolution call — this is background world-filling, not a
-// conversational commitment, so it's fine to just try again next cycle.
-export async function planActivity(characterId, { title, startInMinutes, durationMinutes, details, location, availability }) {
+// Applies a chain of activities from the life-planner, laid out back to
+// back starting at `gapStart` — the app computes the actual timeline
+// (each activity starts when the previous one ends) rather than trusting
+// AI-provided offsets, so a malformed or overlapping response simply
+// can't happen. Stops once the chain would run past `gapEnd`; the model
+// doesn't have to fill the whole block. Batched into one INSERT.
+export async function planActivityChain(characterId, gapStart, gapEnd, activities) {
   const database = db();
-  const validTitle = safeString(title, 120);
-  if (
-    !validTitle ||
-    !Number.isInteger(startInMinutes) ||
-    startInMinutes < 0 ||
-    startInMinutes > 180 ||
-    !Number.isInteger(durationMinutes) ||
-    durationMinutes < 10 ||
-    durationMinutes > 480
-  ) {
-    return { status: "ignored" };
+  if (!Array.isArray(activities) || activities.length === 0) {
+    return { status: "none", applied: [] };
   }
 
-  const startTime = new Date(Date.now() + startInMinutes * 60000);
-  const endTime = new Date(startTime.getTime() + durationMinutes * 60000);
-  const avail = normalizeAvailability(availability, 100);
-  const initialStatus = startInMinutes === 0 ? "active" : "scheduled";
+  const rowsToInsert = [];
+  let cursor = new Date(gapStart);
+  const hardEnd = new Date(gapEnd);
 
-  const conflicts = await findConflicts(characterId, startTime, endTime);
-  if (conflicts.length > 0) {
-    return { status: "conflict", conflictingEvents: conflicts };
+  for (const a of activities) {
+    if (cursor.getTime() >= hardEnd.getTime()) break;
+    const title = safeString(a?.title, 120);
+    const rawDuration = Number(a?.duration_minutes);
+    if (!title || !Number.isFinite(rawDuration)) continue;
+    const duration = Math.max(10, Math.min(300, Math.round(rawDuration)));
+
+    const start = new Date(cursor);
+    let end = new Date(start.getTime() + duration * 60000);
+    if (end.getTime() > hardEnd.getTime()) end = new Date(hardEnd);
+    if (end.getTime() - start.getTime() < 5 * 60000) break; // not worth a sliver activity
+
+    rowsToInsert.push({
+      title,
+      start,
+      end,
+      details: safeString(a?.details) || "",
+      location: safeString(a?.location),
+      availability: normalizeAvailability(a?.availability, 100),
+    });
+    cursor = end;
   }
 
-  const [row] = await database.sql`
-    INSERT INTO calendar_events (character_id, title, start_time, end_time, status, location, details, source, availability)
-    VALUES (${characterId}, ${validTitle}, ${startTime.toISOString()}, ${endTime.toISOString()}, ${initialStatus}, ${safeString(location)}, ${safeString(details) || ""}, 'generated', ${avail})
-    RETURNING *
-  `;
-  return { status: "applied", event: row };
+  if (rowsToInsert.length === 0) return { status: "none", applied: [] };
+
+  const values = [];
+  const params = [];
+  const nowMs = Date.now();
+  rowsToInsert.forEach((r, i) => {
+    const b = i * 8;
+    const status = r.start.getTime() <= nowMs && r.end.getTime() > nowMs ? "active" : "scheduled";
+    values.push(`($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7}, 'generated', $${b + 8})`);
+    params.push(characterId, r.title, r.start.toISOString(), r.end.toISOString(), status, r.location, r.details, r.availability);
+  });
+
+  const inserted = await database.sql.query(
+    `INSERT INTO calendar_events (character_id, title, start_time, end_time, status, location, details, source, availability)
+     VALUES ${values.join(", ")}
+     RETURNING *`,
+    params
+  );
+
+  return { status: "applied", applied: inserted };
 }

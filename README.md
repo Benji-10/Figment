@@ -28,14 +28,29 @@ re-architecting anything.
     bailing on something) which the app validates before applying.
   - **The life-planner AI** (`plan-life.mjs`, a separate scheduled
     function, new prompt in `persona.mjs`) never talks to anyone and
-    doesn't know any specific conversation exists. It only looks at gaps
-    in the character's own calendar and decides what fills them —
-    chores, downtime, errands, seeing a friend — including setting its
-    *own* availability score for that activity. Only genuine fixed
-    commitments (class, a paid shift, a standing call) are hand-seeded in
-    `recurring_events`; everything else in a day originates from this AI,
-    not from hardcoded filler, which is what the spec's "avoid manually
-    tuned content" principle actually asks for once you take it seriously.
+    doesn't know any specific conversation exists. It walks the
+    character's timeline forward from now, finds the next genuinely open
+    stretch (properly — by walking the interval list, not just checking
+    whether "now" is covered, so it can't be fooled by something already
+    scheduled further out), and plans a **chain** of activities into it
+    to the minute — a couple hours of class, then a 15-minute bus ride,
+    then scrolling, then a shower, then getting ready for whatever's
+    next — instead of one isolated activity at a time. It doesn't have to
+    fill the whole gap; unstructured time is a valid outcome. It also
+    sees what's coming up right after the block, including location, and
+    is explicitly told to leave room for getting ready/commuting if that
+    next thing is somewhere else — so when the chat AI (or you, by hand)
+    creates a dinner plan across town, the *next* planner run naturally
+    wraps the preceding time up to it rather than running some unrelated
+    activity right up to the second dinner starts. Runs every 20 minutes
+    but only spends an AI call when there's an actual gap; each call can
+    cover several hours at once, so the schedule reaches a few days of
+    real coverage within a handful of cycles, then just keeps pace with
+    time passing. Only genuine fixed commitments (class, a paid shift, a
+    standing call) are hand-seeded in `recurring_events`; everything else
+    in a day originates from this AI, not from hardcoded filler, which is
+    what the spec's "avoid manually tuned content" principle actually
+    asks for once you take it seriously.
 - **Calendar / event engine** (spec §3–4): recurring commitments
   materialize into concrete dated events automatically, on a real IANA
   timezone (`CHARACTER_TIMEZONE`, default `America/Chicago`) — "2pm" in
@@ -73,6 +88,14 @@ re-architecting anything.
   describes (§8). The deferred delivery piggybacks on the heartbeat
   (below), so it shows up automatically via the existing polling — no
   extra client-side wiring.
+- **Low-effort by default, not maximally helpful**: the chat AI is
+  explicitly told to favor one short message over a burst, skip
+  elaboration, and mostly not ask questions — asking should be the
+  exception, not something it defaults to just to keep a conversation
+  going. It can also send **zero messages** for a given turn (optionally
+  still reacting with just an emoji) when a reply genuinely wouldn't add
+  anything — the read receipt still updates, so it reads as "saw it,
+  didn't feel like replying" rather than a bug.
 - Chat UI: bubbles, grouping, date separators, typing indicator sized to
   message length, read receipts, reply-to-message and emoji reactions
   both via one long-press action menu on any bubble (works the same on
@@ -93,12 +116,10 @@ re-architecting anything.
   no-op with no AI call at all if nothing transitioned, and gated by the
   same availability roll). This keeps spontaneous messages tied to
   something real happening — "my shift just ended" — rather than firing
-  on a timer regardless of state. The prompt also explicitly discourages
-  reflexively ending every message with a question.
+  on a timer regardless of state.
 - A **second scheduled function** (`plan-life.mjs`, every 20 min,
   character-scoped, not conversation-scoped) — the life-planner described
-  above. Only runs the AI call when there's an actual gap in the near-term
-  schedule (nothing covering the next 90 minutes); paced by
+  above, keeping the schedule filled a few days ahead; paced by
   `characters.last_planned_at` so it doesn't replan on every tick.
 - Lightweight polling (every 7s while the tab is visible) so a spontaneous
   or deferred message shows up without a websocket/Blobs realtime setup;
@@ -118,9 +139,11 @@ spec for the full design):
   — the model gets a compact snapshot of upcoming events and recent
   memories up front rather than being able to query for more on demand
 - Multiple characters (schema supports it; the app only looks up one slug)
-- The life-planner only fills the *immediate* gap (next ~90 minutes), not
-  further-out plans like "next Saturday" — far-future spontaneous planning
-  is still only something the chat AI does mid-conversation (spec §6)
+- The life-planner's commute/prep awareness comes from prompt guidance
+  (seeing the next fixed event's location and being told to leave buffer
+  time), not a dedicated "travel time" calculation — it's a judgment call
+  the AI makes each time, not a deterministic distance/mode-of-transport
+  model
 
 ## A note on the model name
 
@@ -210,12 +233,17 @@ Two scheduled functions run independently: `heartbeat.mjs` (every 15 min,
 checks up to 5 recently-active conversations, skips any it already checked
 in the last 25 min) and `plan-life.mjs` (every 20 min, checks up to 10
 characters, skips any it already planned for in the last 20 min and does
-nothing at all — no AI call — if there's no actual gap in the schedule).
-Both stay cheap as usage grows, at the cost of things sometimes landing
-later than the spec's ideal cadence (worst case for a batched reply: up to
-~25 minutes after availability improves; worst case for the world feeling
-"unpopulated": up to ~20 minutes into a new gap). If you deploy this for
-real usage, those batch sizes/intervals are the first knobs to revisit. A
+nothing at all — no AI call — once the schedule is filled through the
+3-day horizon). Each `plan-life.mjs` call that does run can plan several
+hours in one go (up to 10 chained activities), so reaching multi-day
+coverage takes a bounded handful of cycles, not one call per activity —
+after that it's just topping up the trailing edge as time passes, which is
+usually one small call per cycle or a no-op. Both functions stay cheap as
+usage grows, at the cost of things sometimes landing later than the spec's
+ideal cadence (worst case for a batched reply: up to ~25 minutes after
+availability improves; worst case for freshly-created plans not yet having
+commute buffer around them: up to ~20 minutes). If you deploy this for real
+usage, those batch sizes/intervals are the first knobs to revisit. A
 calendar conflict adds one extra Gemini call (only when a conflict actually
 occurs), so it's rare in practice.
 
