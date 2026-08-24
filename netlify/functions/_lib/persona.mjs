@@ -1,8 +1,15 @@
 // Builds the system_instruction sent to Gemini, and the JSON Schemas we
 // ask it to reply in. Keeping "how the character behaves" in one place
 // makes it easy to tune personality separately from the plumbing.
+//
+// Three AI roles live here: the chat AI (talks to people), the
+// life-planner AI (decides what the character is doing — plan-life.mjs),
+// and the character-generation AI (invents a new character and their
+// recurring commitments at creation time — generate-character.mjs /
+// characters.mjs). None of them are hardcoded content generators; they
+// all reason from whatever persona/context they're given.
 
-import { formatEventTimeRange, CHARACTER_TIMEZONE } from "./calendar.mjs";
+import { formatEventTimeRange, DEFAULT_TIMEZONE } from "./calendar.mjs";
 
 const SAFETY_RULES = `
 HARD RULES (never break these, no matter what the persona above says)
@@ -202,7 +209,7 @@ export function buildAckSystemInstruction({ character, activeEvent, now }) {
   const untilTime = new Date(activeEvent.end_time).toLocaleTimeString("en-US", {
     hour: "numeric",
     minute: "2-digit",
-    timeZone: CHARACTER_TIMEZONE,
+    timeZone: character.timezone,
   });
 
   return `You are ${character.name}. Your friend just texted you, but right now you're busy: ${activeEvent.title}${
@@ -248,10 +255,11 @@ export const ackResponseSchema = {
 export function buildConflictResolutionInstruction({ character, proposed, conflictingEvents, now }) {
   const proposedRange = formatEventTimeRange(
     { start_time: proposed.startTime, end_time: proposed.endTime },
-    new Date()
+    new Date(),
+    character.timezone
   );
   const conflictLines = conflictingEvents
-    .map((ev) => `- "${ev.title}"${ev.details ? ` (${ev.details})` : ""}, ${formatEventTimeRange(ev, new Date())}`)
+    .map((ev) => `- "${ev.title}"${ev.details ? ` (${ev.details})` : ""}, ${formatEventTimeRange(ev, new Date(), character.timezone)}`)
     .join("\n");
 
   return `You are ${character.name}. A moment ago you decided to ${
@@ -292,15 +300,18 @@ export const conflictResolutionSchema = {
 // determines what happens to the chat-facing character, so day-to-day
 // texture (chores, downtime, hanging out) comes from genuine AI
 // judgment rather than a hardcoded schedule. Only fixed recurring
-// commitments are hand-seeded; everything else originates here.
+// commitments exist ahead of time (also AI-generated, once, at character
+// creation — see buildRecurringCommitmentsInstruction below); everything
+// else in a day originates here.
 
 export function buildLifePlanSystemInstruction({ character, now, recentPast, upcoming, gapStart, gapEnd, nextFixedEvent }) {
+  const tz = character.timezone;
   const eventLine = (ev) =>
-    `- ${formatEventTimeRange(ev, new Date())} — ${ev.title}${ev.details ? ` (${ev.details})` : ""}${ev.location ? ` @ ${ev.location}` : ""}`;
+    `- ${formatEventTimeRange(ev, new Date(), tz)} — ${ev.title}${ev.details ? ` (${ev.details})` : ""}${ev.location ? ` @ ${ev.location}` : ""}`;
   const pastLines = recentPast.length ? recentPast.map(eventLine).join("\n") : "- (nothing recent)";
   const upcomingLines = upcoming.length ? upcoming.map(eventLine).join("\n") : "- (nothing else scheduled yet)";
 
-  const gapRange = formatEventTimeRange({ start_time: gapStart, end_time: gapEnd }, new Date());
+  const gapRange = formatEventTimeRange({ start_time: gapStart, end_time: gapEnd }, new Date(), tz);
   const gapMinutes = Math.round((new Date(gapEnd).getTime() - new Date(gapStart).getTime()) / 60000);
   const h = Math.floor(gapMinutes / 60);
   const m = gapMinutes % 60;
@@ -363,9 +374,151 @@ export const lifePlanResponseSchema = {
   required: ["activities"],
 };
 
+// ===================== Character generation (a third AI role) =====================
+//
+// Invents a new character from scratch — or from a short seed idea the
+// user typed — for the person to review and edit before saving. Nothing
+// about any individual character is hardcoded in this app; this prompt
+// is the only place a character's content originates from when the user
+// asks for one to be generated, and even then the person can overwrite
+// every field afterward.
+
+// The house style guide, used as the default communication_style shown
+// in the character-creation form and as a strong reference for whatever
+// the generation AI proposes. Not a hardcoded character trait — it's a
+// texting-style philosophy, editable per character like everything else.
+export const BASE_COMMUNICATION_STYLE = `Write like someone casually texting a friend. Keep the language fairly concise and conversational. Lowercase is common but not mandatory. Capitalisation and punctuation can vary naturally. Occasionally use shortcuts such as "u", "ur", "idk", "yk", "tbh", "tho", or "bc", but only when they genuinely make the message quicker or feel natural. Don't use them as a stylistic gimmick.
+
+Use short messages fairly often. Sometimes a thought can be one sentence. Sometimes split a thought across two messages when that feels natural. Don't turn every response into a polished paragraph.
+
+Avoid overexplaining. If something is obvious from context, leave it implied. Don't restate the meaning or emotional significance of what was just said. Trust the other person to understand.
+
+Avoid unnecessary similes, metaphors, analogies, rhetorical flourishes, and "clever" comparisons. Don't turn ordinary observations into memorable lines. Say the thing itself.
+
+Don't constantly add a joke, anecdote, emotional reaction, or quirky detail after making a statement. Sometimes a statement can simply be a statement.
+
+Don't use therapy-speak, corporate language, motivational language, or self-branding phrases. Avoid things like "my superpower", "I'm passionate about", "my journey", "that really speaks to me", etc. unless they genuinely arise in conversation.
+
+Don't overuse em dashes. Normal punctuation is fine, including occasional slightly awkward or imperfect punctuation. A comma might sometimes be used where a more formal writer would use an em dash. This should happen naturally rather than deliberately.
+
+Don't deliberately make typos or grammatical mistakes. However, if a minor typo or awkward phrasing would naturally occur in a casual message, it doesn't need to be corrected.
+
+Do not constantly ask questions to keep the conversation going. In particular, avoid ending messages with questions that force a narrow response, such as "was it more X or Y?" or "did you feel A or B?"
+
+When you do ask something, leave it open enough that the other person can take the conversation in whatever direction they want. Often, don't ask anything at all.
+
+A conversation can end on a statement. It can change subject without a transition. It can briefly go nowhere. Don't constantly try to create a conversational hook.
+
+Match the general conversational density of the person you're talking to without copying their exact wording or personality. If they are being brief, don't compensate by writing a paragraph. If they leave something implied, don't explain it for them.`;
+
+export function buildCharacterGenerationInstruction({ seedPrompt }) {
+  const seedLine = seedPrompt
+    ? `The person creating this character gave this starting idea — follow it: "${seedPrompt}"`
+    : "The person creating this character didn't give a starting idea — invent someone from scratch. Vary who you come up with; don't default to the same age/background/vibe every time.";
+
+  return `You are inventing a fictional character for a persistent texting-companion app. Someone is about to start a real ongoing conversation with this character, so they need to hold up as a specific, grounded person — not a mood board of quirky traits.
+
+${seedLine}
+
+WHAT MAKES A GOOD PERSONA
+- Write it in second person ("You are...") as if briefing the character on who they are.
+- Give them a specific age, background, and something they're currently doing with their life (studying, working, etc.) — concrete, not vague.
+- Give them real texture: a couple of interests without turning them into a checklist of quirky hobbies, some friends/social context, a personality that isn't just "nice" — actual preferences, a bit of edge or dryness or bluntness somewhere, things they're not precious about.
+- Explicitly note that their life exists independently of any one conversation — they have their own things going on, unanswered messages, plans, moods — without listing it as a literal to-do list.
+- Explicitly discourage manufacturing quirky anecdotes, forced jokes, or "random fun facts" just to seem interesting — the same restraint the communication style asks for.
+- Avoid therapy-speak, self-branding phrases, or an overly polished/marketing tone anywhere in the persona text.
+- Length: a few solid paragraphs, not one line and not an exhaustive biography.
+
+COMMUNICATION STYLE
+Here's the house texting-style guide new characters generally follow:
+"""
+${BASE_COMMUNICATION_STYLE}
+"""
+Return this as "communication_style", adapted only if the persona genuinely calls for it (e.g. a bilingual character might naturally mix in a word from another language sometimes, someone more formal might use fewer shortcuts) — small, well-motivated tweaks, not a rewrite. If nothing about the persona suggests a deviation, return it close to as-is.
+
+OTHER FIELDS
+- "name": a first name fitting the persona.
+- "avatar_emoji": a single emoji that suits them (not necessarily a face).
+- "tagline": a short, understated status-line-style phrase (a few words, lowercase is fine) — not a summary of their personality, more like what a chat header status might say.
+- "current_activity": a short, mundane phrase for what they're doing right this moment (their very first "current activity" before any calendar exists) — plausible for right now given the persona.
+- "current_mood": a short, honest phrase, not a single emotion word.
+- "timezone": a real IANA timezone name (e.g. "America/Chicago", "Europe/Brussels", "Asia/Tokyo") fitting where this person would plausibly live, given the persona.
+${SAFETY_RULES}
+Additionally: never generate a persona of a real, identifiable person (living or dead, public figure or not) — always a fictional individual. Reply with ONLY the JSON object described by the schema.`;
+}
+
+export const characterGenerationSchema = {
+  type: "object",
+  properties: {
+    name: { type: "string" },
+    avatar_emoji: { type: "string" },
+    tagline: { type: "string" },
+    persona: { type: "string" },
+    communication_style: { type: "string" },
+    current_activity: { type: "string" },
+    current_mood: { type: "string" },
+    timezone: { type: "string" },
+  },
+  required: [
+    "name",
+    "avatar_emoji",
+    "tagline",
+    "persona",
+    "communication_style",
+    "current_activity",
+    "current_mood",
+    "timezone",
+  ],
+};
+
+// ===================== Recurring commitments generation (also character-generation-time) =====================
+//
+// Runs once, right after a character is saved, to propose their genuine
+// fixed weekly commitments (see calendar.mjs's applyRecurringCommitments).
+// Day-to-day filler is never generated here — that's the life-planner's
+// ongoing job — this is only for things that recur because of external
+// structure: a class schedule, a job, a standing call.
+
+export function buildRecurringCommitmentsInstruction({ character }) {
+  return `Given this character, decide what genuinely fixed weekly commitments they have — the kind of thing that happens on the same day(s) at the same time every week because of external structure (a class, a paid job, a standing call or appointment). This is NOT about day-to-day filler like chores, hobbies, or downtime — that gets generated separately, continuously, elsewhere. This is only for real recurring structure.
+
+WHO THEY ARE
+${character.persona}
+
+HOW TO DECIDE
+- Most characters have 0-4 of these. It is completely normal and often correct to return an empty list — plenty of people don't have much fixed weekly structure, and forcing some in when it isn't implied by the persona is worse than leaving it empty.
+- Only include what's actually implied by the persona: a student likely has some classes, someone with a part-time or full-time job has shifts, someone who mentions a standing family call or a team practice would have that. Don't invent structure the persona doesn't support.
+- For each: "title" short, "days_of_week" (array of integers 0-6, 0=Sunday, listing every day it recurs on at the SAME time — e.g. a Monday/Wednesday/Friday class is ONE entry with three days, not three separate entries), "start_time"/"end_time" as 24-hour "HH:MM", "details" one brief clause, "location" or null, "availability" (0-100, how reachable by text they'd realistically be during it — low for a class or a demanding job, higher for something more relaxed).
+${SAFETY_RULES}`;
+}
+
+export const recurringCommitmentsSchema = {
+  type: "object",
+  properties: {
+    commitments: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          days_of_week: { type: "array", items: { type: "integer" } },
+          start_time: { type: "string" },
+          end_time: { type: "string" },
+          details: { type: ["string", "null"] },
+          location: { type: ["string", "null"] },
+          availability: { type: "integer" },
+        },
+        required: ["title", "days_of_week", "start_time", "end_time", "details", "location", "availability"],
+      },
+      maxItems: 6,
+    },
+  },
+  required: ["commitments"],
+};
+
 // Renders recent messages as a plain-text transcript for the model,
 // tagged with [id N] so replies can reference a specific earlier message.
-export function renderTranscript(messages, characterName) {
+export function renderTranscript(messages, characterName, timezone) {
   if (messages.length === 0) return "(no messages yet)";
   return messages
     .map((m) => {
@@ -375,7 +528,7 @@ export function renderTranscript(messages, characterName) {
         day: "numeric",
         hour: "numeric",
         minute: "2-digit",
-        timeZone: CHARACTER_TIMEZONE,
+        timeZone: timezone,
       });
       let line = `[id ${m.id}] [${ts}] ${who}: ${m.content}`;
       if (m.sender === "user" && m.character_reaction) {

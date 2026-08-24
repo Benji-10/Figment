@@ -44,7 +44,7 @@ export default async (req) => {
 
   for (const character of characters) {
     try {
-      await syncCalendar(character.id);
+      await syncCalendar(character.id, character.timezone);
       const gap = await findNextGap(character.id);
 
       if (!gap) {
@@ -67,7 +67,7 @@ export default async (req) => {
 
       const systemInstruction = buildLifePlanSystemInstruction({
         character,
-        now: formatNowLabel(),
+        now: formatNowLabel(character.timezone),
         recentPast,
         upcoming,
         gapStart: gap.start,

@@ -5,24 +5,29 @@
 // and applies. See persona.mjs for the schemas the model fills in, and
 // reply.mjs for how a detected conflict gets resolved.
 //
-// Two distinct AI roles write to this calendar:
+// Timezone is per-character (character.timezone), not a global constant —
+// every function that needs one takes it as a parameter. DEFAULT_TIMEZONE
+// is only a fallback suggestion for the character-creation form.
+//
+// Three distinct AI roles write to this calendar, none of them hardcoded:
 //   - The chat AI (persona.mjs's chat/heartbeat schemas) can create/move/
 //     cancel/extend events as a byproduct of conversation.
 //   - The life-planner AI (plan-life.mjs, a separate scheduled function)
 //     fills genuinely open gaps in the schedule with plausible activities
-//     — it's the only source of day-to-day "what are they up to" filler;
-//     this module never invents activities itself, and only recurring
-//     commitments are hand-seeded (see schema.mjs).
+//     — it's the only source of day-to-day "what are they up to" filler.
+//   - The character-generation AI (generate-character.mjs) proposes each
+//     new character's *recurring* commitments (class, a job, a standing
+//     call) once, at creation time, based on their persona — nothing is
+//     seeded in the database ahead of time.
 
 import { db } from "./db.mjs";
 
 const MATERIALIZE_WINDOW_DAYS = 4; // how far ahead recurring events get generated
 const UPCOMING_LIMIT = 6;
 
-// The character's own timezone — "2pm" in a recurring event means 2pm
-// here, not 2pm UTC. Override with CHARACTER_TIMEZONE if you deploy this
-// somewhere else. Must be a valid IANA zone name.
-export const CHARACTER_TIMEZONE = process.env.CHARACTER_TIMEZONE || "America/Chicago";
+// Suggested default for the character-creation form only — every
+// character stores and uses its own `timezone` column from here on.
+export const DEFAULT_TIMEZONE = process.env.CHARACTER_TIMEZONE || "America/Chicago";
 
 /* ===================== Timezone-aware time helpers ===================== */
 //
@@ -99,36 +104,34 @@ function zonedWallTimeToUtc(year, month, day, hour, minute, timeZone) {
 // Turns the model's { day_offset, hour, minute } into a real UTC Date,
 // where day_offset is relative to "today" in the character's own
 // timezone (0 = today, 1 = tomorrow, ...).
-export function resolveDateTime(dayOffset, hour, minute, referenceNow = new Date()) {
-  const targetYmd = addDaysToYMD(zonedYMD(referenceNow, CHARACTER_TIMEZONE), dayOffset);
-  return zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, hour, minute, CHARACTER_TIMEZONE);
+export function resolveDateTime(dayOffset, hour, minute, timezone, referenceNow = new Date()) {
+  const targetYmd = addDaysToYMD(zonedYMD(referenceNow, timezone), dayOffset);
+  return zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, hour, minute, timezone);
 }
 
-function describeDay(date, now) {
+function describeDay(date, now, timezone) {
   const dayDiff = Math.round(
-    (ymdAnchor(zonedYMD(date, CHARACTER_TIMEZONE)).getTime() -
-      ymdAnchor(zonedYMD(now, CHARACTER_TIMEZONE)).getTime()) /
-      86400000
+    (ymdAnchor(zonedYMD(date, timezone)).getTime() - ymdAnchor(zonedYMD(now, timezone)).getTime()) / 86400000
   );
   if (dayDiff === 0) return "Today";
   if (dayDiff === 1) return "Tomorrow";
-  return date.toLocaleDateString("en-US", { weekday: "short", timeZone: CHARACTER_TIMEZONE });
+  return date.toLocaleDateString("en-US", { weekday: "short", timeZone: timezone });
 }
 
-function formatClockTime(isoOrDate) {
+function formatClockTime(isoOrDate, timezone) {
   const d = new Date(isoOrDate);
-  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: CHARACTER_TIMEZONE });
+  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: timezone });
 }
 
 // "Full weekday, month day, year, time" in the character's own timezone —
 // what gets shown to the model as "current date/time".
-export function formatNowLabel(date = new Date()) {
-  return date.toLocaleString("en-US", { dateStyle: "full", timeStyle: "short", timeZone: CHARACTER_TIMEZONE });
+export function formatNowLabel(timezone, date = new Date()) {
+  return date.toLocaleString("en-US", { dateStyle: "full", timeStyle: "short", timeZone: timezone });
 }
 
-export function formatEventTimeRange(event, now) {
+export function formatEventTimeRange(event, now, timezone) {
   const start = new Date(event.start_time);
-  return `${describeDay(start, now)} ${formatClockTime(event.start_time)}–${formatClockTime(event.end_time)}`;
+  return `${describeDay(start, now, timezone)} ${formatClockTime(event.start_time, timezone)}–${formatClockTime(event.end_time, timezone)}`;
 }
 
 /* ===================== Validation ===================== */
@@ -148,13 +151,22 @@ const toPositiveInt = (v) => {
   return Number.isInteger(n) && n > 0 ? n : null;
 };
 // 0-100, how reachable-by-text the character realistically is during an
-// event. Replaces a plain busy/free boolean — mechanically, it's just the
-// odds a given incoming message gets an immediate full reply (see
-// rollEngagement) rather than a deferred/ack-only response.
+// event. Mechanically it's just the odds a given incoming message gets an
+// immediate full reply (see rollEngagement) rather than a deferred/ack-
+// only response.
 function normalizeAvailability(v, fallback = 100) {
   const n = Number(v);
   if (!Number.isInteger(n)) return fallback;
   return Math.max(0, Math.min(100, n));
+}
+
+export function slugify(text, maxLen = 40) {
+  const s = String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "")
+    .slice(0, maxLen);
+  return s || "event";
 }
 
 // A single weighted coin flip: should the character fully engage right
@@ -174,10 +186,10 @@ export function rollEngagement(availability) {
 // to call on every request that needs an accurate "current activity" —
 // batched into one INSERT regardless of how many templates/days there
 // are, rather than one round-trip per (template, day) pair.
-export async function syncCalendar(characterId) {
+export async function syncCalendar(characterId, timezone) {
   const database = db();
   const now = new Date();
-  const todayYmd = zonedYMD(now, CHARACTER_TIMEZONE);
+  const todayYmd = zonedYMD(now, timezone);
 
   const templates = await database.sql`
     SELECT * FROM recurring_events WHERE character_id = ${characterId} AND active = true
@@ -195,8 +207,8 @@ export async function syncCalendar(characterId) {
       const [eh, em] = String(tpl.end_time_of_day).split(":").map(Number);
       rowsToInsert.push({
         title: tpl.title,
-        startTime: zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, sh, sm, CHARACTER_TIMEZONE),
-        endTime: zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, eh, em, CHARACTER_TIMEZONE),
+        startTime: zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, sh, sm, timezone),
+        endTime: zonedWallTimeToUtc(targetYmd.year, targetYmd.month, targetYmd.day, eh, em, timezone),
         location: tpl.location,
         details: tpl.details,
         availability: normalizeAvailability(tpl.availability),
@@ -244,6 +256,63 @@ export async function syncCalendar(characterId) {
     UPDATE calendar_events SET status = 'completed', updated_at = now()
     WHERE character_id = ${characterId} AND status IN ('scheduled', 'active') AND end_time <= now()
   `;
+}
+
+// Called once, right after a character is created, from the recurring
+// commitments the generation AI proposed. `commitments` is an array of
+// { title, days_of_week: [0-6...], start_time: "HH:MM", end_time: "HH:MM",
+// details, location, availability }. Expands multi-day commitments (e.g.
+// a Mon/Wed/Fri class) into one recurring_events row per day, with an
+// app-generated slug — the AI never invents the slug/id, keeping that
+// mechanical detail owned by the app. Invalid entries are silently
+// skipped rather than failing the whole batch.
+export async function applyRecurringCommitments(characterId, commitments) {
+  const database = db();
+  if (!Array.isArray(commitments) || commitments.length === 0) {
+    return { status: "none", count: 0 };
+  }
+
+  const rows = [];
+  const timeRe = /^\d{1,2}:\d{2}$/;
+  for (const c of commitments) {
+    const title = safeString(c?.title, 80);
+    const days = Array.isArray(c?.days_of_week)
+      ? [...new Set(c.days_of_week.filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))]
+      : [];
+    const startTime = timeRe.test(c?.start_time || "") ? c.start_time : null;
+    const endTime = timeRe.test(c?.end_time || "") ? c.end_time : null;
+    if (!title || days.length === 0 || !startTime || !endTime || startTime >= endTime) continue;
+
+    const availability = normalizeAvailability(c?.availability, 100);
+    const details = safeString(c?.details) || "";
+    const location = safeString(c?.location);
+    const baseSlug = slugify(title);
+    for (const day of days) {
+      rows.push({ title, day, startTime, endTime, details, location, availability, slug: `${baseSlug}-${day}` });
+    }
+  }
+  if (rows.length === 0) return { status: "none", count: 0 };
+
+  const values = [];
+  const params = [];
+  rows.forEach((r, i) => {
+    const b = i * 9;
+    values.push(
+      `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}::time, $${b + 6}::time, $${b + 7}, $${b + 8}, $${b + 9})`
+    );
+    params.push(characterId, r.slug, r.title, r.day, r.startTime, r.endTime, r.details, r.location, r.availability);
+  });
+
+  const inserted = await database.sql.query(
+    `INSERT INTO recurring_events
+       (character_id, slug, title, day_of_week, start_time_of_day, end_time_of_day, details, location, availability)
+     VALUES ${values.join(", ")}
+     ON CONFLICT (character_id, slug) DO NOTHING
+     RETURNING *`,
+    params
+  );
+
+  return { status: "applied", count: inserted.length };
 }
 
 // Which events for this character transitioned (started or ended) since
@@ -301,11 +370,11 @@ export function describeCurrentActivity(character, activeEvent) {
   return activeEvent.location ? `${activeEvent.title} @ ${activeEvent.location}` : activeEvent.title;
 }
 
-export function formatCalendarForPrompt({ activeEvent, upcoming }, now = new Date()) {
+export function formatCalendarForPrompt({ activeEvent, upcoming }, now, timezone) {
   const lines = [];
   if (activeEvent) {
     lines.push(
-      `Right now (until ${formatClockTime(activeEvent.end_time)}): ${activeEvent.title}` +
+      `Right now (until ${formatClockTime(activeEvent.end_time, timezone)}): ${activeEvent.title}` +
         (activeEvent.details ? ` — ${activeEvent.details}` : "") +
         (activeEvent.location ? ` @ ${activeEvent.location}` : "")
     );
@@ -316,7 +385,7 @@ export function formatCalendarForPrompt({ activeEvent, upcoming }, now = new Dat
     lines.push("Coming up (reference by [id N] if you need to move/cancel/extend one):");
     for (const ev of upcoming) {
       lines.push(
-        `  [id ${ev.id}] ${formatEventTimeRange(ev, now)} — ${ev.title}` +
+        `  [id ${ev.id}] ${formatEventTimeRange(ev, now, timezone)} — ${ev.title}` +
           (ev.details ? ` (${ev.details})` : "") +
           (ev.location ? ` @ ${ev.location}` : "")
       );
@@ -354,7 +423,7 @@ async function findConflicts(characterId, startTime, endTime, excludeEventId = n
 // call to force it through after a conflict has been resolved (see
 // reply.mjs) — this cancels the given events first, then applies without
 // re-checking for overlaps against them.
-export async function applyCalendarAction(characterId, action, opts = {}) {
+export async function applyCalendarAction(characterId, action, timezone, opts = {}) {
   const { overrideConflicts = false, cancelEventIds = [] } = opts;
   if (!action || typeof action !== "object") return { status: "ignored" };
   const database = db();
@@ -381,7 +450,7 @@ export async function applyCalendarAction(characterId, action, opts = {}) {
       return { status: "ignored", action: "create" };
     }
 
-    const startTime = resolveDateTime(action.day_offset, action.start_hour, action.start_minute);
+    const startTime = resolveDateTime(action.day_offset, action.start_hour, action.start_minute, timezone);
     const endTime = new Date(startTime.getTime() + action.duration_minutes * 60000);
     const details = safeString(action.details) || "";
     const location = safeString(action.location);
@@ -427,7 +496,7 @@ export async function applyCalendarAction(characterId, action, opts = {}) {
     if (!existing) return { status: "not_found", action: "move" };
 
     const originalDurationMs = new Date(existing.end_time).getTime() - new Date(existing.start_time).getTime();
-    const startTime = resolveDateTime(action.day_offset, action.start_hour, action.start_minute);
+    const startTime = resolveDateTime(action.day_offset, action.start_hour, action.start_minute, timezone);
     const durationMs = isValidPositiveDuration(action.duration_minutes)
       ? action.duration_minutes * 60000
       : originalDurationMs;

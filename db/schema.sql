@@ -1,7 +1,8 @@
 -- Optional. The app creates this schema automatically on its first
 -- request (see netlify/functions/_lib/schema.mjs), so you do not need to
--- run this manually. It is here in case you would rather set the database
--- up yourself via the Neon SQL editor or psql before your first deploy.
+-- run this manually. No character content is seeded here — characters
+-- are created at runtime (AI-generated or user-authored) via the app's
+-- "+ New Character" flow, never hardcoded.
 -- (Generated from schema.mjs so the two never drift apart.)
 
 CREATE TABLE IF NOT EXISTS app_users (
@@ -14,19 +15,30 @@ CREATE TABLE IF NOT EXISTS app_users (
 
 CREATE TABLE IF NOT EXISTS characters (
       id                   SERIAL PRIMARY KEY,
-      slug                 TEXT UNIQUE NOT NULL,
+      slug                 TEXT,
       name                 TEXT NOT NULL,
       avatar_emoji         TEXT NOT NULL DEFAULT '🙂',
       tagline              TEXT NOT NULL DEFAULT '',
       persona              TEXT NOT NULL,
       communication_style  TEXT NOT NULL,
-      current_activity     TEXT NOT NULL DEFAULT 'just going about their day',
-      current_mood         TEXT NOT NULL DEFAULT 'pretty normal',
+      timezone             TEXT NOT NULL DEFAULT 'America/Chicago',
+      current_activity     TEXT NOT NULL DEFAULT 'just getting started',
+      current_mood         TEXT NOT NULL DEFAULT 'settling in',
       status_updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      created_by           TEXT REFERENCES app_users(id) ON DELETE SET NULL,
+      last_planned_at      TIMESTAMPTZ,
       created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS last_planned_at TIMESTAMPTZ;
+
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'America/Chicago';
+
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS created_by TEXT REFERENCES app_users(id) ON DELETE SET NULL;
+
+ALTER TABLE characters ALTER COLUMN slug DROP NOT NULL;
+
+ALTER TABLE characters DROP CONSTRAINT IF EXISTS characters_slug_key;
 
 CREATE TABLE IF NOT EXISTS conversations (
       id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -117,50 +129,3 @@ ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS availability INTEGER NOT NU
 ALTER TABLE calendar_events DROP COLUMN IF EXISTS busy;
 
 CREATE INDEX IF NOT EXISTS idx_calendar_events_character_time ON calendar_events(character_id, start_time);
-
-INSERT INTO characters
-      (slug, name, avatar_emoji, tagline, persona, communication_style, current_activity, current_mood)
-      VALUES ('sam', 'Sam', '🌙', 'probably procrastinating something right now', 'You are a 23-year-old grad student, sociable and a little scattered. You genuinely like your friends and get excited about small stuff (a good song, a weird dream, decent weather). You procrastinate, you overthink texts sometimes, and you have your own life going on -- classes, a part-time job, a group chat that is always chaotic. You are warm and curious about people but you are not endlessly available or agreeable; you have moods and a life outside this conversation.', 'Lowercase most of the time, casual punctuation, occasional typo left uncorrected, sparing but genuine emoji use (not one on every message). Sends short messages more often than long ones, and will split a thought into 2-3 quick texts instead of one paragraph when that is how the thought actually comes out.', 'just getting their day going, nothing planned yet', 'pretty relaxed, a little tired')
-      ON CONFLICT (slug) DO NOTHING;
-
-INSERT INTO recurring_events
-        (character_id, slug, title, day_of_week, start_time_of_day, end_time_of_day, details, location, availability)
-        VALUES ((SELECT id FROM characters WHERE slug = 'sam'), 'seminar-mon', 'Methods seminar', 1, '10:00', '11:30', 'a required grad seminar, kind of dry but the prof notices who skips', 'Social Sciences building', 8)
-        ON CONFLICT (character_id, slug) DO NOTHING;
-
-INSERT INTO recurring_events
-        (character_id, slug, title, day_of_week, start_time_of_day, end_time_of_day, details, location, availability)
-        VALUES ((SELECT id FROM characters WHERE slug = 'sam'), 'seminar-wed', 'Methods seminar', 3, '10:00', '11:30', 'a required grad seminar, kind of dry but the prof notices who skips', 'Social Sciences building', 8)
-        ON CONFLICT (character_id, slug) DO NOTHING;
-
-INSERT INTO recurring_events
-        (character_id, slug, title, day_of_week, start_time_of_day, end_time_of_day, details, location, availability)
-        VALUES ((SELECT id FROM characters WHERE slug = 'sam'), 'seminar-fri', 'Methods seminar', 5, '10:00', '11:30', 'a required grad seminar, kind of dry but the prof notices who skips', 'Social Sciences building', 8)
-        ON CONFLICT (character_id, slug) DO NOTHING;
-
-INSERT INTO recurring_events
-        (character_id, slug, title, day_of_week, start_time_of_day, end_time_of_day, details, location, availability)
-        VALUES ((SELECT id FROM characters WHERE slug = 'sam'), 'shift-tue', 'coffee shop shift', 2, '14:00', '18:30', 'part-time barista shift, decent tips, exhausting on your feet by the end', 'the cafe', 20)
-        ON CONFLICT (character_id, slug) DO NOTHING;
-
-INSERT INTO recurring_events
-        (character_id, slug, title, day_of_week, start_time_of_day, end_time_of_day, details, location, availability)
-        VALUES ((SELECT id FROM characters WHERE slug = 'sam'), 'shift-thu', 'coffee shop shift', 4, '14:00', '18:30', 'part-time barista shift, decent tips, exhausting on your feet by the end', 'the cafe', 20)
-        ON CONFLICT (character_id, slug) DO NOTHING;
-
-INSERT INTO recurring_events
-        (character_id, slug, title, day_of_week, start_time_of_day, end_time_of_day, details, location, availability)
-        VALUES ((SELECT id FROM characters WHERE slug = 'sam'), 'family-call-sun', 'family call', 0, '19:00', '19:30', 'weekly call with mom, sometimes runs long, easy to text through', NULL, 55)
-        ON CONFLICT (character_id, slug) DO NOTHING;
-
-UPDATE recurring_events SET availability = 8
-      WHERE slug IN ('seminar-mon','seminar-wed','seminar-fri')
-        AND character_id = (SELECT id FROM characters WHERE slug = 'sam') AND availability = 100;
-
-UPDATE recurring_events SET availability = 20
-      WHERE slug IN ('shift-tue','shift-thu')
-        AND character_id = (SELECT id FROM characters WHERE slug = 'sam') AND availability = 100;
-
-UPDATE recurring_events SET availability = 55
-      WHERE slug = 'family-call-sun'
-        AND character_id = (SELECT id FROM characters WHERE slug = 'sam') AND availability = 100;

@@ -1092,11 +1092,18 @@ var getUser = async () => {
 var state = {
   authMode: "login",
   // "login" | "signup"
+  view: "auth",
+  // "auth" | "list" | "form" | "chat"
+  conversations: [],
+  // roster from GET /api/characters
+  formMode: "create",
+  // "create" | "edit"
+  editingCharacterId: null,
   character: null,
+  // current chat's character info (from /api/me)
+  conversationId: null,
   messages: [],
-  // ordered array of message objects (see serializeMessage on the server)
   replyTarget: null,
-  // { id, snippet }
   pollTimer: null,
   headerTimer: null,
   lastPolledId: null,
@@ -1111,15 +1118,21 @@ async function boot() {
   }
   const user = await getUser().catch(() => null);
   if (user) {
-    showChat();
+    showList();
   } else {
     showAuth();
   }
 }
+function showScreen(name) {
+  state.view = name;
+  el("auth-screen").hidden = name !== "auth";
+  el("list-screen").hidden = name !== "list";
+  el("form-screen").hidden = name !== "form";
+  el("chat-screen").hidden = name !== "chat";
+  if (name !== "chat") stopPolling();
+}
 function showAuth() {
-  el("auth-screen").hidden = false;
-  el("chat-screen").hidden = true;
-  stopPolling();
+  showScreen("auth");
 }
 function setAuthError(message) {
   const box = el("auth-error");
@@ -1147,11 +1160,11 @@ el("auth-form").addEventListener("submit", async (e) => {
   try {
     if (state.authMode === "login") {
       await login(email, password);
-      showChat();
+      showList();
     } else {
       const user = await signup(email, password);
       if (user && (user.confirmedAt || user.confirmed_at)) {
-        showChat();
+        showList();
       } else {
         setAuthError("Account created! Check your email to confirm it, then log in.");
         state.authMode = "login";
@@ -1165,42 +1178,16 @@ el("auth-form").addEventListener("submit", async (e) => {
     submitBtn.disabled = false;
   }
 });
-el("logout-btn").addEventListener("click", async () => {
+async function doLogout() {
   await logout().catch(() => {
   });
-  state.messages = [];
+  state.conversations = [];
   state.character = null;
-  el("message-list").innerHTML = "";
+  state.conversationId = null;
+  state.messages = [];
   showAuth();
-});
-async function showChat() {
-  el("auth-screen").hidden = true;
-  el("chat-screen").hidden = false;
-  try {
-    const me = await api("/api/me");
-    state.character = me.character;
-    renderHeader(me.character);
-    const data = await api("/api/messages");
-    state.messages = data.messages;
-    renderAllMessages();
-    scrollToBottom();
-    startPolling();
-  } catch (err) {
-    console.error(err);
-    if (err.status === 401) {
-      showAuth();
-    }
-  }
 }
-function renderHeader(character) {
-  el("character-avatar").textContent = character.avatarEmoji || "\u{1F642}";
-  el("character-name").textContent = character.name;
-  el("status-text").textContent = character.currentActivity || "around";
-  const dot = el("status-dot");
-  const isBusy = Boolean(character.busy);
-  dot.classList.toggle("active", !isBusy);
-  dot.classList.toggle("busy", isBusy);
-}
+el("list-logout-btn").addEventListener("click", doLogout);
 async function api(path, options = {}) {
   const res = await fetch(path, {
     ...options,
@@ -1222,6 +1209,240 @@ async function api(path, options = {}) {
     throw error;
   }
   return res.json();
+}
+async function showList() {
+  showScreen("list");
+  try {
+    const data = await api("/api/characters");
+    state.conversations = data.conversations;
+    renderConversationList();
+  } catch (err) {
+    console.error(err);
+    if (err.status === 401) showAuth();
+  }
+}
+function timeAgo(iso) {
+  if (!iso) return "";
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.round(diffMs / 6e4);
+  if (mins < 1) return "now";
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.round(hours / 24);
+  if (days < 7) return `${days}d`;
+  return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+function renderConversationList() {
+  const list = el("conversation-list");
+  const empty = el("list-empty");
+  list.innerHTML = "";
+  if (state.conversations.length === 0) {
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+  for (const convo of state.conversations) {
+    const row = document.createElement("button");
+    row.className = "conversation-row";
+    row.type = "button";
+    const avatar = document.createElement("div");
+    avatar.className = "avatar";
+    avatar.textContent = convo.avatarEmoji || "\u{1F642}";
+    row.appendChild(avatar);
+    const body = document.createElement("div");
+    body.className = "conversation-row-body";
+    const top = document.createElement("div");
+    top.className = "conversation-row-top";
+    const name = document.createElement("span");
+    name.className = "conversation-row-name";
+    name.textContent = convo.name;
+    top.appendChild(name);
+    if (convo.lastMessage) {
+      const time = document.createElement("span");
+      time.className = "conversation-row-time";
+      time.textContent = timeAgo(convo.lastMessage.createdAt);
+      top.appendChild(time);
+    }
+    body.appendChild(top);
+    const preview = document.createElement("p");
+    preview.className = "conversation-row-preview";
+    if (convo.lastMessage) {
+      const prefix = convo.lastMessage.sender === "user" ? "You: " : "";
+      preview.textContent = prefix + convo.lastMessage.content;
+    } else {
+      preview.textContent = convo.tagline || convo.currentActivity || "say hi";
+    }
+    body.appendChild(preview);
+    row.appendChild(body);
+    row.addEventListener("click", () => openConversation(convo.conversationId));
+    list.appendChild(row);
+  }
+}
+el("new-character-fab").addEventListener("click", () => openCreateForm());
+function resetForm() {
+  el("form-seed").value = "";
+  el("form-avatar").value = "";
+  el("form-name").value = "";
+  el("form-tagline").value = "";
+  el("form-persona").value = "";
+  el("form-style").value = "";
+  el("form-activity").value = "";
+  el("form-mood").value = "";
+  el("form-timezone").value = "";
+  setFormError(null);
+}
+function populateForm(data) {
+  el("form-avatar").value = data.avatarEmoji || "";
+  el("form-name").value = data.name || "";
+  el("form-tagline").value = data.tagline || "";
+  el("form-persona").value = data.persona || "";
+  el("form-style").value = data.communicationStyle || "";
+  el("form-activity").value = data.currentActivity || "";
+  el("form-mood").value = data.currentMood || "";
+  el("form-timezone").value = data.timezone || "";
+}
+function setFormError(message) {
+  const box = el("form-error");
+  if (!message) {
+    box.hidden = true;
+    box.textContent = "";
+  } else {
+    box.hidden = false;
+    box.textContent = message;
+  }
+}
+function openCreateForm() {
+  state.formMode = "create";
+  state.editingCharacterId = null;
+  el("form-title").textContent = "New character";
+  el("form-submit").textContent = "Create character";
+  el("generate-block").hidden = false;
+  resetForm();
+  showScreen("form");
+}
+function openEditForm() {
+  if (!state.character) return;
+  const cached = state.conversations.find((c) => c.characterId === state.character.id);
+  state.formMode = "edit";
+  state.editingCharacterId = state.character.id;
+  el("form-title").textContent = "Edit character";
+  el("form-submit").textContent = "Save changes";
+  el("generate-block").hidden = true;
+  setFormError(null);
+  populateForm({
+    avatarEmoji: state.character.avatarEmoji,
+    name: state.character.name,
+    tagline: state.character.tagline,
+    persona: cached?.persona,
+    communicationStyle: cached?.communicationStyle,
+    currentActivity: cached?.currentActivity,
+    currentMood: cached?.currentMood,
+    timezone: cached?.timezone
+  });
+  showScreen("form");
+}
+el("chat-edit-btn").addEventListener("click", openEditForm);
+el("form-back-btn").addEventListener("click", () => {
+  if (state.formMode === "edit" && state.conversationId) {
+    showScreen("chat");
+    startPolling();
+  } else {
+    showList();
+  }
+});
+el("generate-btn").addEventListener("click", async () => {
+  const btn = el("generate-btn");
+  const label = el("generate-btn-label");
+  const seedPrompt = el("form-seed").value.trim();
+  btn.disabled = true;
+  const prevLabel = label.textContent;
+  label.textContent = "\u2728 Generating\u2026";
+  setFormError(null);
+  try {
+    const result = await api("/api/generate-character", {
+      method: "POST",
+      body: JSON.stringify({ seedPrompt })
+    });
+    populateForm(result.draft);
+  } catch (err) {
+    console.error(err);
+    setFormError(err.message || "Couldn't generate a character. Try again.");
+  } finally {
+    btn.disabled = false;
+    label.textContent = prevLabel;
+  }
+});
+el("character-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  setFormError(null);
+  const name = el("form-name").value.trim();
+  const persona = el("form-persona").value.trim();
+  if (!name || !persona) {
+    setFormError("Name and persona are required.");
+    return;
+  }
+  const payload = {
+    name,
+    avatarEmoji: el("form-avatar").value.trim(),
+    tagline: el("form-tagline").value.trim(),
+    persona,
+    communicationStyle: el("form-style").value.trim(),
+    currentActivity: el("form-activity").value.trim(),
+    currentMood: el("form-mood").value.trim(),
+    timezone: el("form-timezone").value.trim()
+  };
+  const submitBtn = el("form-submit");
+  submitBtn.disabled = true;
+  try {
+    if (state.formMode === "create") {
+      const result = await api("/api/characters", { method: "POST", body: JSON.stringify(payload) });
+      await showList();
+      await openConversation(result.conversationId);
+    } else {
+      payload.characterId = state.editingCharacterId;
+      await api("/api/characters", { method: "PATCH", body: JSON.stringify(payload) });
+      await showList();
+      if (state.conversationId) await openConversation(state.conversationId);
+    }
+  } catch (err) {
+    console.error(err);
+    setFormError(err.message || "Something went wrong. Try again.");
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+el("chat-back-btn").addEventListener("click", () => showList());
+async function openConversation(conversationId) {
+  state.conversationId = conversationId;
+  state.messages = [];
+  state.replyTarget = null;
+  clearReplyPreview();
+  el("message-list").innerHTML = "";
+  showScreen("chat");
+  try {
+    const me = await api(`/api/me?conversationId=${encodeURIComponent(conversationId)}`);
+    state.character = me.character;
+    renderHeader(me.character);
+    const data = await api(`/api/messages?conversationId=${encodeURIComponent(conversationId)}`);
+    state.messages = data.messages;
+    renderAllMessages();
+    scrollToBottom();
+    startPolling();
+  } catch (err) {
+    console.error(err);
+    if (err.status === 401) showAuth();
+    else if (err.status === 404) showList();
+  }
+}
+function renderHeader(character) {
+  el("character-avatar").textContent = character.avatarEmoji || "\u{1F642}";
+  el("character-name").textContent = character.name;
+  el("status-text").textContent = character.currentActivity || "around";
+  const dot = el("status-dot");
+  const isBusy = Boolean(character.busy);
+  dot.classList.toggle("active", !isBusy);
+  dot.classList.toggle("busy", isBusy);
 }
 function renderAllMessages() {
   const list = el("message-list");
@@ -1316,7 +1537,7 @@ textarea.addEventListener("keydown", (e) => {
 el("composer").addEventListener("submit", async (e) => {
   e.preventDefault();
   const content = textarea.value.trim();
-  if (!content) return;
+  if (!content || !state.conversationId) return;
   const replyToMessageId = state.replyTarget?.id || null;
   clearReplyPreview();
   textarea.value = "";
@@ -1337,7 +1558,7 @@ el("composer").addEventListener("submit", async (e) => {
   try {
     const result = await api("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ content, replyToMessageId })
+      body: JSON.stringify({ conversationId: state.conversationId, content, replyToMessageId })
     });
     const idx = state.messages.findIndex((m) => m.id === tempId);
     if (idx !== -1) state.messages[idx] = result.userMessage;
@@ -1440,7 +1661,7 @@ function openMessageActions(row, msg) {
     try {
       const result = await api("/api/react", {
         method: "POST",
-        body: JSON.stringify({ messageId: msg.id, emoji: btn.dataset.emoji })
+        body: JSON.stringify({ conversationId: state.conversationId, messageId: msg.id, emoji: btn.dataset.emoji })
       });
       msg.userReaction = result.emoji;
       renderAllMessages();
@@ -1479,7 +1700,7 @@ function handleVisibility() {
     if (state.headerTimer) clearInterval(state.headerTimer);
     state.pollTimer = null;
     state.headerTimer = null;
-  } else if (!state.pollTimer) {
+  } else if (!state.pollTimer && state.view === "chat") {
     pollForNewMessages();
     refreshHeader();
     state.pollTimer = setInterval(pollForNewMessages, 7e3);
@@ -1487,8 +1708,9 @@ function handleVisibility() {
   }
 }
 async function refreshHeader() {
+  if (!state.conversationId) return;
   try {
-    const me = await api("/api/me");
+    const me = await api(`/api/me?conversationId=${encodeURIComponent(state.conversationId)}`);
     state.character = me.character;
     renderHeader(me.character);
   } catch (err) {
@@ -1499,9 +1721,11 @@ async function refreshHeader() {
   }
 }
 async function pollForNewMessages() {
-  if (!state.lastPolledId || state.revealing) return;
+  if (!state.lastPolledId || !state.conversationId) return;
   try {
-    const data = await api(`/api/messages?after_id=${encodeURIComponent(state.lastPolledId)}`);
+    const data = await api(
+      `/api/messages?conversationId=${encodeURIComponent(state.conversationId)}&after_id=${encodeURIComponent(state.lastPolledId)}`
+    );
     if (data.messages.length === 0) return;
     state.lastPolledId = data.messages[data.messages.length - 1].id;
     const newMessages = data.messages.filter((m) => !hasMessage(m.id));

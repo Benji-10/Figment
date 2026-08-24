@@ -1,14 +1,19 @@
-import { requireUser, jsonError } from "./_lib/auth.mjs";
+import { requireUser, jsonError, HttpError } from "./_lib/auth.mjs";
 import { db } from "./_lib/db.mjs";
-import { getCharacter, ensureConversation } from "./_lib/conversation.mjs";
+import { getConversationForUser } from "./_lib/conversation.mjs";
 
 export default async (req, context) => {
   try {
     const user = await requireUser();
-    const character = await getCharacter();
-    const conversation = await ensureConversation(user.id, character.id);
 
     const url = new URL(req.url);
+    const conversationId = url.searchParams.get("conversationId");
+    if (!conversationId) throw new HttpError(400, "conversationId is required.");
+
+    const found = await getConversationForUser(user.id, conversationId);
+    if (!found) throw new HttpError(404, "Conversation not found.");
+    const { character, conversation } = found;
+
     const rawAfterId = url.searchParams.get("after_id");
     const afterId = rawAfterId && /^\d+$/.test(rawAfterId) ? rawAfterId : null;
     const limit = Math.min(

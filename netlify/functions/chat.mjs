@@ -1,6 +1,6 @@
 import { requireUser, jsonError, HttpError } from "./_lib/auth.mjs";
 import { db } from "./_lib/db.mjs";
-import { getCharacter, ensureConversation } from "./_lib/conversation.mjs";
+import { getConversationForUser } from "./_lib/conversation.mjs";
 import { syncCalendar, getActiveEvent, rollEngagement } from "./_lib/calendar.mjs";
 import { deliverChatReply, deliverAckIfWarranted } from "./_lib/reply.mjs";
 
@@ -17,16 +17,20 @@ export default async (req, context) => {
       throw new HttpError(400, "Expected a JSON body.");
     }
 
+    const conversationId = body.conversationId;
+    if (!conversationId) throw new HttpError(400, "conversationId is required.");
+
     const content = (body.content || "").trim();
     if (!content) throw new HttpError(400, "Message can't be empty.");
     if (content.length > MAX_MESSAGE_LENGTH) {
       throw new HttpError(400, `Message is too long (max ${MAX_MESSAGE_LENGTH} characters).`);
     }
 
-    const character = await getCharacter();
-    const conversation = await ensureConversation(user.id, character.id);
-    const database = db();
+    const found = await getConversationForUser(user.id, conversationId);
+    if (!found) throw new HttpError(404, "Conversation not found.");
+    const { character, conversation } = found;
 
+    const database = db();
     const replyToId = await resolveReplyTo(conversation.id, body.replyToMessageId);
 
     const [userMessageRow] = await database.sql`
@@ -44,8 +48,8 @@ export default async (req, context) => {
     // now", at most a short acknowledgment goes out (only if this
     // message seems urgent enough to warrant one), and the rest of the
     // pending messages wait for the heartbeat to answer as one batched
-    // reply.
-    await syncCalendar(character.id);
+    // reply once the character is free again.
+    await syncCalendar(character.id, character.timezone);
     const activeEvent = await getActiveEvent(character.id);
     const respondNow = rollEngagement(activeEvent ? activeEvent.availability : 100);
 

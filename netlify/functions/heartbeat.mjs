@@ -15,7 +15,7 @@
 // look at a small batch of the most recently active conversations per run.
 
 import { db, ensureSchema } from "./_lib/db.mjs";
-import { getActiveEvent } from "./_lib/calendar.mjs";
+import { getActiveEvent, rollEngagement } from "./_lib/calendar.mjs";
 import { deliverChatReply, deliverSpontaneousCheck } from "./_lib/reply.mjs";
 
 const BATCH_SIZE = 5;
@@ -61,11 +61,15 @@ export default async (req) => {
 
       if (count > 0) {
         const activeEvent = await getActiveEvent(character.id);
-        if (activeEvent?.busy) {
+        // Same probabilistic gate as the synchronous chat path — not a
+        // hard wall, so a batched reply can still land even mid-event if
+        // the roll favors it, and definitely will once availability
+        // genuinely improves.
+        if (!rollEngagement(activeEvent ? activeEvent.availability : 100)) {
           await database.sql`
             UPDATE conversations SET last_heartbeat_at = now() WHERE id = ${conversation.id}
           `;
-          results.push({ conversationId: conversation.id, outcome: "waiting_busy", pending: count });
+          results.push({ conversationId: conversation.id, outcome: "waiting_low_availability", pending: count });
         } else {
           const { characterMessageRows } = await deliverChatReply({ character, conversation });
           results.push({

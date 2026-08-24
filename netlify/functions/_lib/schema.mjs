@@ -8,15 +8,13 @@
 // takes one statement at a time). Safe to run repeatedly: everything is
 // IF NOT EXISTS / ON CONFLICT DO NOTHING, and the ALTER TABLE lines below
 // exist purely to bring already-deployed databases forward when a column
-// changes shape (e.g. the old boolean `busy` becoming a graduated
-// `availability` score) — CREATE TABLE IF NOT EXISTS alone won't do that
-// for a table that already exists.
-
-const DEFAULT_PERSONA =
-  "You are a 23-year-old grad student, sociable and a little scattered. You genuinely like your friends and get excited about small stuff (a good song, a weird dream, decent weather). You procrastinate, you overthink texts sometimes, and you have your own life going on -- classes, a part-time job, a group chat that is always chaotic. You are warm and curious about people but you are not endlessly available or agreeable; you have moods and a life outside this conversation.";
-
-const DEFAULT_STYLE =
-  "Lowercase most of the time, casual punctuation, occasional typo left uncorrected, sparing but genuine emoji use (not one on every message). Sends short messages more often than long ones, and will split a thought into 2-3 quick texts instead of one paragraph when that is how the thought actually comes out.";
+// changes shape — CREATE TABLE IF NOT EXISTS alone won't do that for a
+// table that already exists.
+//
+// No character, persona, or event content is seeded here — see
+// generate-character.mjs and characters.mjs. Characters (and their
+// recurring commitments) are created at runtime, either AI-generated or
+// user-authored, never hardcoded.
 
 export const SCHEMA_STATEMENTS = [
   {
@@ -31,20 +29,31 @@ export const SCHEMA_STATEMENTS = [
   {
     text: `CREATE TABLE IF NOT EXISTS characters (
       id                   SERIAL PRIMARY KEY,
-      slug                 TEXT UNIQUE NOT NULL,
+      slug                 TEXT,
       name                 TEXT NOT NULL,
       avatar_emoji         TEXT NOT NULL DEFAULT '🙂',
       tagline              TEXT NOT NULL DEFAULT '',
       persona              TEXT NOT NULL,
       communication_style  TEXT NOT NULL,
-      current_activity     TEXT NOT NULL DEFAULT 'just going about their day',
-      current_mood         TEXT NOT NULL DEFAULT 'pretty normal',
+      timezone             TEXT NOT NULL DEFAULT 'America/Chicago',
+      current_activity     TEXT NOT NULL DEFAULT 'just getting started',
+      current_mood         TEXT NOT NULL DEFAULT 'settling in',
       status_updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      created_by           TEXT REFERENCES app_users(id) ON DELETE SET NULL,
+      last_planned_at      TIMESTAMPTZ,
       created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
     )`,
   },
-  // Backward-compat: pacing column for the life-planner (plan-life.mjs).
+  // Backward-compat for databases created before these columns existed.
   { text: `ALTER TABLE characters ADD COLUMN IF NOT EXISTS last_planned_at TIMESTAMPTZ` },
+  { text: `ALTER TABLE characters ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'America/Chicago'` },
+  { text: `ALTER TABLE characters ADD COLUMN IF NOT EXISTS created_by TEXT REFERENCES app_users(id) ON DELETE SET NULL` },
+  // `slug` used to be the primary (and only) way to look up "the"
+  // character via a CHARACTER_SLUG env var; now every character is
+  // looked up by id through a conversation, so slug is purely cosmetic —
+  // drop the old NOT NULL/UNIQUE constraints from earlier deployments.
+  { text: `ALTER TABLE characters ALTER COLUMN slug DROP NOT NULL` },
+  { text: `ALTER TABLE characters DROP CONSTRAINT IF EXISTS characters_slug_key` },
   {
     text: `CREATE TABLE IF NOT EXISTS conversations (
       id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -108,7 +117,6 @@ export const SCHEMA_STATEMENTS = [
       UNIQUE (character_id, slug)
     )`,
   },
-  // Backward-compat: databases created before `availability` replaced `busy`.
   { text: `ALTER TABLE recurring_events ADD COLUMN IF NOT EXISTS availability INTEGER NOT NULL DEFAULT 100 CHECK (availability BETWEEN 0 AND 100)` },
   { text: `ALTER TABLE recurring_events DROP COLUMN IF EXISTS busy` },
   {
@@ -133,90 +141,4 @@ export const SCHEMA_STATEMENTS = [
   { text: `ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS availability INTEGER NOT NULL DEFAULT 100 CHECK (availability BETWEEN 0 AND 100)` },
   { text: `ALTER TABLE calendar_events DROP COLUMN IF EXISTS busy` },
   { text: `CREATE INDEX IF NOT EXISTS idx_calendar_events_character_time ON calendar_events(character_id, start_time)` },
-  {
-    text: `INSERT INTO characters
-      (slug, name, avatar_emoji, tagline, persona, communication_style, current_activity, current_mood)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      ON CONFLICT (slug) DO NOTHING`,
-    params: [
-      "sam",
-      "Sam",
-      "🌙",
-      "probably procrastinating something right now",
-      DEFAULT_PERSONA,
-      DEFAULT_STYLE,
-      "just getting their day going, nothing planned yet",
-      "pretty relaxed, a little tired",
-    ],
-  },
-  // Only genuine fixed commitments are hand-seeded here — things that
-  // happen on a schedule because of external structure (class, a paid
-  // shift, a standing call), each with an honest availability score.
-  // Everything else in the day (chores, downtime, hanging out, meals...)
-  // comes from the life-planner AI filling gaps on its own — see
-  // plan-life.mjs. That's a deliberate split: recurring commitments are
-  // stable facts, day-to-day filler is exactly what shouldn't be
-  // hand-authored/hardcoded.
-  ...seedRecurringEvent("seminar-mon", "Methods seminar", 1, "10:00", "11:30", {
-    details: "a required grad seminar, kind of dry but the prof notices who skips",
-    location: "Social Sciences building",
-    availability: 8,
-  }),
-  ...seedRecurringEvent("seminar-wed", "Methods seminar", 3, "10:00", "11:30", {
-    details: "a required grad seminar, kind of dry but the prof notices who skips",
-    location: "Social Sciences building",
-    availability: 8,
-  }),
-  ...seedRecurringEvent("seminar-fri", "Methods seminar", 5, "10:00", "11:30", {
-    details: "a required grad seminar, kind of dry but the prof notices who skips",
-    location: "Social Sciences building",
-    availability: 8,
-  }),
-  ...seedRecurringEvent("shift-tue", "coffee shop shift", 2, "14:00", "18:30", {
-    details: "part-time barista shift, decent tips, exhausting on your feet by the end",
-    location: "the cafe",
-    availability: 20,
-  }),
-  ...seedRecurringEvent("shift-thu", "coffee shop shift", 4, "14:00", "18:30", {
-    details: "part-time barista shift, decent tips, exhausting on your feet by the end",
-    location: "the cafe",
-    availability: 20,
-  }),
-  ...seedRecurringEvent("family-call-sun", "family call", 0, "19:00", "19:30", {
-    details: "weekly call with mom, sometimes runs long, easy to text through",
-    location: null,
-    availability: 55,
-  }),
-  // Corrects availability for rows seeded by earlier deployments before
-  // this column existed (the ALTER above backfills existing rows to the
-  // column default of 100, which is wrong for the low-availability ones
-  // above — ON CONFLICT DO NOTHING on the inserts means those rows
-  // otherwise wouldn't get touched).
-  {
-    text: `UPDATE recurring_events SET availability = 8
-      WHERE slug IN ('seminar-mon','seminar-wed','seminar-fri')
-        AND character_id = (SELECT id FROM characters WHERE slug = 'sam') AND availability = 100`,
-  },
-  {
-    text: `UPDATE recurring_events SET availability = 20
-      WHERE slug IN ('shift-tue','shift-thu')
-        AND character_id = (SELECT id FROM characters WHERE slug = 'sam') AND availability = 100`,
-  },
-  {
-    text: `UPDATE recurring_events SET availability = 55
-      WHERE slug = 'family-call-sun'
-        AND character_id = (SELECT id FROM characters WHERE slug = 'sam') AND availability = 100`,
-  },
 ];
-
-function seedRecurringEvent(slug, title, dayOfWeek, startTime, endTime, { details, location, availability }) {
-  return [
-    {
-      text: `INSERT INTO recurring_events
-        (character_id, slug, title, day_of_week, start_time_of_day, end_time_of_day, details, location, availability)
-        VALUES ((SELECT id FROM characters WHERE slug = $1), $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (character_id, slug) DO NOTHING`,
-      params: ["sam", slug, title, dayOfWeek, startTime, endTime, details || "", location || null, availability],
-    },
-  ];
-}

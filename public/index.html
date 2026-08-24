@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>sam — chat</title>
+  <title>chat</title>
   <link rel="icon" href="data:," />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -16,9 +16,9 @@
     <!-- ===================== AUTH SCREEN ===================== -->
     <section id="auth-screen" class="screen">
       <div class="auth-card">
-        <div class="auth-mark" aria-hidden="true">🌙</div>
-        <h1>sam</h1>
-        <p class="auth-sub">a persistent chat companion with a life of its own</p>
+        <div class="auth-mark" aria-hidden="true">💬</div>
+        <h1>chat</h1>
+        <p class="auth-sub">persistent AI characters with lives of their own</p>
 
         <form id="auth-form" class="auth-form">
           <label class="field">
@@ -37,21 +37,119 @@
       </div>
     </section>
 
+    <!-- ===================== CHARACTER LIST SCREEN ===================== -->
+    <section id="list-screen" class="screen" hidden>
+      <header class="list-header">
+        <h1>Your characters</h1>
+        <button id="list-logout-btn" class="icon-btn" title="Log out" aria-label="Log out">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
+      </header>
+
+      <main id="conversation-list" class="conversation-list"></main>
+
+      <div id="list-empty" class="list-empty" hidden>
+        <p class="list-empty-mark" aria-hidden="true">✨</p>
+        <p class="list-empty-title">No characters yet</p>
+        <p class="list-empty-sub">Create one to start a conversation.</p>
+      </div>
+
+      <button id="new-character-fab" class="fab" aria-label="New character">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      </button>
+    </section>
+
+    <!-- ===================== CREATE / EDIT CHARACTER SCREEN ===================== -->
+    <section id="form-screen" class="screen" hidden>
+      <header class="form-header">
+        <button id="form-back-btn" class="icon-btn" aria-label="Back">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+        <h1 id="form-title">New character</h1>
+        <span class="form-header-spacer" aria-hidden="true"></span>
+      </header>
+
+      <form id="character-form" class="character-form">
+
+        <div id="generate-block" class="generate-block">
+          <label class="field">
+            <span>Starting idea <em>(optional)</em></span>
+            <input type="text" id="form-seed" placeholder="e.g. a chaotic art student in Berlin" maxlength="300" />
+          </label>
+          <button type="button" id="generate-btn" class="btn-secondary">
+            <span id="generate-btn-label">✨ Generate a character</span>
+          </button>
+          <p id="generate-hint" class="generate-hint">Fills in the fields below — you can edit anything after.</p>
+        </div>
+
+        <div class="form-divider"><span>details</span></div>
+
+        <div class="avatar-name-row">
+          <label class="field avatar-field">
+            <span>Avatar</span>
+            <input type="text" id="form-avatar" maxlength="8" placeholder="🙂" />
+          </label>
+          <label class="field name-field">
+            <span>Name</span>
+            <input type="text" id="form-name" maxlength="60" placeholder="Required" required />
+          </label>
+        </div>
+
+        <label class="field">
+          <span>Tagline <em>(shows under their name)</em></span>
+          <input type="text" id="form-tagline" maxlength="120" placeholder="e.g. currently avoiding a deadline" />
+        </label>
+
+        <label class="field">
+          <span>Persona</span>
+          <textarea id="form-persona" rows="8" placeholder="Who are they? Age, background, personality, what their life looks like..." required></textarea>
+        </label>
+
+        <label class="field">
+          <span>Communication style <em>(leave blank for the default texting style)</em></span>
+          <textarea id="form-style" rows="6" placeholder="Leave blank to use the default casual-texting style guide."></textarea>
+        </label>
+
+        <div class="form-row">
+          <label class="field">
+            <span>Current activity</span>
+            <input type="text" id="form-activity" maxlength="200" placeholder="just getting started" />
+          </label>
+          <label class="field">
+            <span>Current mood</span>
+            <input type="text" id="form-mood" maxlength="200" placeholder="settling in" />
+          </label>
+        </div>
+
+        <label class="field">
+          <span>Timezone <em>(IANA name)</em></span>
+          <input type="text" id="form-timezone" maxlength="60" placeholder="America/Chicago" />
+        </label>
+
+        <p id="form-error" class="auth-error" hidden></p>
+
+        <button type="submit" id="form-submit" class="btn-primary">Create character</button>
+      </form>
+    </section>
+
     <!-- ===================== CHAT SCREEN ===================== -->
     <section id="chat-screen" class="screen" hidden>
       <header class="chat-header">
+        <button id="chat-back-btn" class="icon-btn" aria-label="Back to characters">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
         <div class="header-identity">
-          <div class="avatar" id="character-avatar">🌙</div>
+          <div class="avatar" id="character-avatar">🙂</div>
           <div class="header-text">
-            <h1 id="character-name">Sam</h1>
+            <h1 id="character-name">—</h1>
             <p class="status-line">
               <span id="status-dot" class="status-dot"></span>
               <span id="status-text">getting settled in…</span>
             </p>
           </div>
         </div>
-        <button id="logout-btn" class="icon-btn" title="Log out" aria-label="Log out">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        <button id="chat-edit-btn" class="icon-btn" title="Edit character" aria-label="Edit character">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         </button>
       </header>
 
@@ -75,7 +173,7 @@
         <textarea
           id="composer-input"
           rows="1"
-          placeholder="Message Sam…"
+          placeholder="Message…"
           maxlength="2000"
           required
         ></textarea>

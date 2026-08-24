@@ -1,6 +1,6 @@
 import { requireUser, jsonError, HttpError } from "./_lib/auth.mjs";
 import { db } from "./_lib/db.mjs";
-import { getCharacter, ensureConversation } from "./_lib/conversation.mjs";
+import { getConversationForUser } from "./_lib/conversation.mjs";
 
 export default async (req, context) => {
   try {
@@ -13,14 +13,17 @@ export default async (req, context) => {
       throw new HttpError(400, "Expected a JSON body.");
     }
 
+    const conversationId = body.conversationId;
     const messageId = body.messageId;
     const emoji = (body.emoji || "").trim();
+    if (!conversationId) throw new HttpError(400, "conversationId is required.");
     if (!messageId || !emoji || !/^\d+$/.test(String(messageId))) {
       throw new HttpError(400, "A valid messageId and emoji are required.");
     }
 
-    const character = await getCharacter();
-    const conversation = await ensureConversation(user.id, character.id);
+    const found = await getConversationForUser(user.id, conversationId);
+    if (!found) throw new HttpError(404, "Conversation not found.");
+    const { conversation } = found;
     const database = db();
 
     // Make sure this message actually belongs to the requesting user's conversation.

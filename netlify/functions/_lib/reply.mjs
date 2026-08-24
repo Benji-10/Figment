@@ -44,7 +44,7 @@ async function resolveCalendarAction({ character, action, label }) {
     return { result: { status: "ignored" }, followUpMessage: null };
   }
 
-  let result = await applyCalendarAction(character.id, action);
+  let result = await applyCalendarAction(character.id, action, character.timezone);
 
   if (result.status !== "conflict") {
     return { result, followUpMessage: null };
@@ -69,7 +69,7 @@ async function resolveCalendarAction({ character, action, label }) {
   }
 
   if (decision.resolution === "proceed_and_cancel_conflicting") {
-    result = await applyCalendarAction(character.id, action, {
+    result = await applyCalendarAction(character.id, action, character.timezone, {
       overrideConflicts: true,
       cancelEventIds: result.conflictingEvents.map((e) => e.id),
     });
@@ -113,7 +113,7 @@ function describeTransition(ev) {
 export async function deliverChatReply({ character, conversation }) {
   const database = db();
 
-  await syncCalendar(character.id);
+  await syncCalendar(character.id, character.timezone);
   const [activeEvent, upcoming, history, memories] = await Promise.all([
     getActiveEvent(character.id),
     getUpcomingEvents(character.id),
@@ -121,8 +121,9 @@ export async function deliverChatReply({ character, conversation }) {
     getRecentMemories(conversation.id),
   ]);
 
-  const label = formatNowLabel();
-  const calendarText = formatCalendarForPrompt({ activeEvent, upcoming });
+  const now = new Date();
+  const label = formatNowLabel(character.timezone, now);
+  const calendarText = formatCalendarForPrompt({ activeEvent, upcoming }, now, character.timezone);
   const effectiveCharacter = {
     ...character,
     current_activity: describeCurrentActivity(character, activeEvent),
@@ -134,7 +135,7 @@ export async function deliverChatReply({ character, conversation }) {
     now: label,
     calendarText,
   });
-  const input = renderTranscript(history, character.name);
+  const input = renderTranscript(history, character.name, character.timezone);
 
   const aiResult = await generateStructured({
     systemInstruction,
@@ -204,7 +205,7 @@ export async function deliverChatReply({ character, conversation }) {
 // spontaneous messages tied to something real happening rather than
 // firing on a timer regardless of state.
 export async function deliverSpontaneousCheck({ character, conversation }) {
-  await syncCalendar(character.id);
+  await syncCalendar(character.id, character.timezone);
   const activeEvent = await getActiveEvent(character.id);
 
   if (!rollEngagement(activeEvent ? activeEvent.availability : 100)) {
@@ -225,8 +226,9 @@ export async function deliverSpontaneousCheck({ character, conversation }) {
     getRecentMemories(conversation.id),
   ]);
 
-  const label = formatNowLabel();
-  const calendarText = formatCalendarForPrompt({ activeEvent, upcoming });
+  const now = new Date();
+  const label = formatNowLabel(character.timezone, now);
+  const calendarText = formatCalendarForPrompt({ activeEvent, upcoming }, now, character.timezone);
   const effectiveCharacter = {
     ...character,
     current_activity: describeCurrentActivity(character, activeEvent),
@@ -239,7 +241,7 @@ export async function deliverSpontaneousCheck({ character, conversation }) {
     calendarText,
     trigger,
   });
-  const input = renderTranscript(history, character.name);
+  const input = renderTranscript(history, character.name, character.timezone);
 
   const aiResult = await generateStructured({
     systemInstruction,
@@ -304,7 +306,11 @@ export async function deliverAckIfWarranted({ character, conversation, activeEve
   `;
   if (pending.length === 0) return null;
 
-  const systemInstruction = buildAckSystemInstruction({ character, activeEvent, now: formatNowLabel() });
+  const systemInstruction = buildAckSystemInstruction({
+    character,
+    activeEvent,
+    now: formatNowLabel(character.timezone),
+  });
   const input = pending.map((m) => `Friend: ${m.content}`).join("\n");
 
   const aiResult = await generateStructured({
